@@ -1,5 +1,5 @@
 /**
- * Result of the position sizing calculation.
+ * Result of the Stage 1 sizing calculation.
  */
 export interface SizingResult {
   readonly quantity: number;
@@ -9,105 +9,62 @@ export interface SizingResult {
 }
 
 /**
- * Liquidity threshold for risk reduction.
- * As discussed in Lean V2 roadmap, pools below this depth are considered "Thin".
- */
-const THIN_LIQUIDITY_THRESHOLD = 250_000;
-
-/**
- * PositionSizer determines the Stage 1 entry size based on portfolio risk 
- * and pool microstructure (liquidity and slippage).
+ * PositionSizer V2.1
+ * 
+ * Logic:
+ * 1. Dynamic R: If liquidity is < $300k, use 0.3R (Probe). If > $300k, use 0.5R.
+ * 2. Risk Math: Size = TargetRiskUSD / (Entry - Stop).
+ * 3. Exposure Cap: Position total USD value cannot exceed 70% of portfolio.
+ * 4. Impact Cap: Position total USD value cannot exceed 0.5% of pool liquidity.
  */
 export class PositionSizer {
-  /**
-   * Calculates the safe quantity to purchase for a Stage 1 entry.
-   * 
-   * Math breakdown:
-   * 1. Risk Amount = Portfolio * Risk% (capped at 1.5%)
-   * 2. If Liquidity < $250k, Risk Amount = Risk Amount * 0.6 (40% reduction)
-   * 3. Raw Quantity = Risk Amount / (EntryPrice - StopPrice)
-   * 4. Position USD = Raw Quantity * EntryPrice
-   * 5. If Position USD > (Liquidity * 0.5%), cap size to 0.5% of pool
-   * 6. Slippage = Position USD / Liquidity
-   */
+  private static readonly PORTFOLIO_EXPOSURE_CAP = 0.70; 
+  private static readonly LIQUIDITY_IMPACT_CAP = 0.005;  
+  private static readonly HEALTHY_LIQUIDITY_FLOOR = 300_000;
+
   public static calculateStage1Size(
     portfolioValue: number,
-    riskPercent: number, // e.g., 0.015 for 1.5%
+    baseRiskAmount: number, // The absolute 1.5% 'R' unit (e.g., $15)
     entryPrice: number,
     stopPrice: number,
-    poolLiquidity: number,
-    maxPoolImpactPercent: number = 0.005 // 0.5%
+    poolLiquidity: number
   ): SizingResult {
-    // 0. Initial Safety Checks
-    if (entryPrice <= stopPrice || poolLiquidity <= 0 || portfolioValue <= 0) {
+    // 1. Dynamic R Multiplier (0.3R for thin pools, 0.5R for healthy)
+    const rMultiplier = poolLiquidity < this.HEALTHY_LIQUIDITY_FLOOR ? 0.3 : 0.5;
+    const targetRiskUsd = baseRiskAmount * rMultiplier;
+
+    // 2. Initial Risk-Based Quantity
+    const stopDistance = entryPrice - stopPrice;
+    if (stopDistance <= 0 || poolLiquidity <= 0) {
       return { quantity: 0, effectiveRisk: 0, expectedSlippage: 0, rejected: true };
     }
-
-    // 1. Calculate Adjusted Risk Amount
-    const clampedRiskPercent = Math.min(riskPercent, 0.015);
-    let riskAmountUsd = portfolioValue * clampedRiskPercent;
-
-    // Rule 4: Liquidity-based risk reduction (Thin pool penalty)
-    if (poolLiquidity < THIN_LIQUIDITY_THRESHOLD) {
-      riskAmountUsd *= 0.60;
-    }
-
-    // 2. Determine Quantity based on Stop Distance
-    const stopDistance = entryPrice - stopPrice;
-    let quantity = riskAmountUsd / stopDistance;
+    
+    let quantity = targetRiskUsd / stopDistance;
     let positionUsd = quantity * entryPrice;
 
-    // Rule 3: Liquidity Cap (Max 0.5% of pool)
-    const maxAllowedUsd = poolLiquidity * maxPoolImpactPercent;
-    if (positionUsd > maxAllowedUsd) {
-      positionUsd = maxAllowedUsd;
+    // 3. Apply Microstructure and Portfolio Caps
+    // Limit A: 70% of Portfolio Total
+    const maxExposureUsd = portfolioValue * this.PORTFOLIO_EXPOSURE_CAP;
+    
+    // Limit B: 0.5% of Pool Liquidity (Anti-Slippage)
+    const maxLiquidityUsd = poolLiquidity * this.LIQUIDITY_IMPACT_CAP;
+
+    const finalMaxUsd = Math.min(maxExposureUsd, maxLiquidityUsd);
+
+    if (positionUsd > finalMaxUsd) {
+      positionUsd = finalMaxUsd;
       quantity = positionUsd / entryPrice;
     }
 
-    // 3. Estimate Slippage
-    // Linear model: Slippage % is approximately the ratio of trade size to pool depth
-    const expectedSlippage = this.estimateSlippage(positionUsd, poolLiquidity);
-
-    // Rule 5: Reject if estimated slippage > 1.2%
-    const rejected = expectedSlippage > 0.012;
-
-    // 4. Final Effective Risk (Actual USD lost if stop hit, excluding slippage)
-    const effectiveRisk = quantity * stopDistance;
+    // 4. Final Rejection Logic
+    const expectedSlippage = positionUsd / poolLiquidity;
+    const rejected = expectedSlippage > 0.012 || poolLiquidity < 150000;
 
     return {
       quantity: rejected ? 0 : quantity,
-      effectiveRisk: rejected ? 0 : effectiveRisk,
+      effectiveRisk: quantity * stopDistance,
       expectedSlippage,
       rejected
     };
   }
-
-  /**
-   * Internal slippage estimator.
-   * Simple impact model where impact scales with pool depth.
-   */
-  private static estimateSlippage(positionUsd: number, poolLiquidity: number): number {
-    if (poolLiquidity === 0) return 1;
-    return positionUsd / poolLiquidity;
-  }
 }
-
-/**
- * MOCK USAGE EXAMPLE
- * 
- * const result = PositionSizer.calculateStage1Size(
- *   1000,   // $1000 portfolio
- *   0.015,  // 1.5% max risk ($15)
- *   0.10,   // Entry at $0.10
- *   0.09,   // Stop at $0.09 (10% dist)
- *   300000, // $300k liquidity
- *   0.005   // 0.5% impact cap
- * );
- * 
- * Result: { 
- *   quantity: 150, 
- *   effectiveRisk: 15, 
- *   expectedSlippage: 0.00005, 
- *   rejected: false 
- * }
- */
