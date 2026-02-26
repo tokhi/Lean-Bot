@@ -13,6 +13,8 @@ import { ScalingEngine } from "./core/ScalingEngine.js";
 import { PortfolioRiskManager } from "./risk/PortfolioRiskManager.js";
 import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
 import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
+import { QuoteValidator } from "./execution/QuoteValidator.js";
+import { CONFIG } from "./config.js";
 
 /**
  * Orchestrator V2.1
@@ -128,7 +130,7 @@ export class Orchestrator {
    * Handles logic for finding and entering a new trade.
    */
   private async evaluateEntry(current: Candle, history: Candle[], regime: any): Promise<void> {
-    const signal = EntryEngine.evaluate(history, regime, 150000);
+    const signal = EntryEngine.evaluate(history, regime, CONFIG.MIN_LIQUIDITY_USD);
     
     if (signal.enter) {
       const currentBalance = this.initialBalance + this.riskManager.getStatus().currentPnL;
@@ -142,11 +144,31 @@ export class Orchestrator {
       );
 
       if (!sizing.rejected && sizing.quantity > 0) {
+        // --- V2.1 FIREWALL INTEGRATION ---
+        
+        // 1. Calculate stats for Risk Manager
+        const currentActiveCount = this.activePosition ? 1 : 0;
+        const currentActiveRiskR = this.activePosition ? 1.0 : 0; // Simplified for single trade
+
+        // 2. Run Quote Validator (The Pre-Trade Firewall)
+        const validation = QuoteValidator.validate({
+          amountUsd: sizing.quantity * current.close,
+          poolLiquidity: current.liquidity,
+          slippageEstimate: sizing.expectedSlippage,
+          isRiskActive: this.riskManager.canTrade(currentActiveCount, currentActiveRiskR)
+        });
+
+        if (!validation.valid) {
+          console.log(`[VALIDATOR] Entry Blocked: ${validation.reason}`);
+          return;
+        }
+
+        // 3. Execution (If validated)
         const result = await this.executionLayer.executeBuy({ 
           tokenAddress: "MOCK_TOKEN", 
           amountUsd: sizing.quantity * current.close, 
-          slippageTolerance: 0.01,
-          marketPrice: current.close // Fix: Passing market price
+          slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000,
+          marketPrice: current.close 
         });
 
         this.auditor.auditExecution(current.close, result);
@@ -161,7 +183,7 @@ export class Orchestrator {
           openTime: current.timestamp 
         };
         
-        console.log(`[ORCHESTRATOR] ENTRY Stage 1 | Price: ${result.filledPrice.toFixed(4)} | Risk: $${sizing.effectiveRisk.toFixed(2)}`);
+        console.log(`[ORCHESTRATOR] ENTRY Stage 1 | Price: ${result.filledPrice.toFixed(4)}`);
       }
     }
   }

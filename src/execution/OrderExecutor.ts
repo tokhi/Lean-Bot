@@ -1,56 +1,101 @@
-/**
- * Types of execution actions.
- */
-export type ExecutionAction = 'STAGE_1_ENTRY' | 'SCALING_ADD' | 'STANDARD_EXIT' | 'EMERGENCY_EXIT';
+import { CONFIG } from "../config.js";
+import type { 
+  IExecutionLayer, 
+  ExecutionResult, 
+  ExecutionOptions 
+} from "./interfaces/IExecutionLayer.js";
+import { SlippageModel } from "./SlippageModel.js";
 
 /**
- * OrderExecutor V2.1 (Dry Run Mode)
+ * OrderExecutor V2.1
  * 
- * Logic:
- * 1. Jito Tip: Adds a fixed $ value (simulated in SOL) to the transaction.
- * 2. Atomic Partitioning: If the position is large relative to pool liquidity,
- *    it calculates how many sequential blocks (chunks) the order should take.
+ * The bridge between the Orchestrator and the Jupiter Aggregator.
+ * Implements strict mode-switching to prevent accidental fund usage.
  */
-export class OrderExecutor {
-  private static readonly JITO_TIP_SOL = 0.001; // Standard tip to bypass mempool
-  private static readonly MAX_BLOCK_IMPACT = 0.003; // 0.3% max impact per block
+export class OrderExecutor implements IExecutionLayer {
+  
+  private readonly JUP_QUOTE_API = "https://quote-api.jup.ag/v6/quote";
+  private readonly JUP_SWAP_API = "https://quote-api.jup.ag/v6/swap";
 
   /**
-   * Generates a "Dry Run" report of an intended transaction.
+   * Executes a Buy order.
+   * Checks CONFIG.EXECUTION_MODE to decide between logging or transacting.
    */
-  public static executeDryRun(
-    action: ExecutionAction,
-    tokenAddress: string,
-    quantity: number,
-    price: number,
-    poolLiquidity: number
-  ) {
-    const totalValueUsd = quantity * price;
+  public async executeBuy(options: ExecutionOptions): Promise<ExecutionResult> {
+    if (CONFIG.EXECUTION_MODE === "DRY_RUN") {
+      return this.handleDryRun("BUY", options);
+    }
 
-    // 1. Calculate Atomic Partitioning (Rule: Don't destroy our own price)
-    const impactPerBlockLimit = poolLiquidity * this.MAX_BLOCK_IMPACT;
-    const chunks = Math.ceil(totalValueUsd / impactLimitUsd);
-    const finalChunks = Math.max(1, Math.min(chunks, 5)); // Cap at 5 blocks for safety
+    return this.handleLiveSwap("BUY", options);
+  }
 
-    // 2. Prepare the Execution Log
-    const report = {
-      timestamp: Date.now(),
-      action,
-      tokenAddress,
-      totalQuantity: quantity,
-      priceAtAction: price,
-      totalValueUsd: totalValueUsd.toFixed(2),
-      jitoTipSol: this.JITO_TIP_SOL,
-      atomicChunks: finalChunks,
-      isBundle: true, // All V2.1 trades are bundled for MEV protection
+  /**
+   * Executes a Sell order.
+   */
+  public async executeSell(options: ExecutionOptions): Promise<ExecutionResult> {
+    if (CONFIG.EXECUTION_MODE === "DRY_RUN") {
+      return this.handleDryRun("SELL", options);
+    }
+
+    return this.handleLiveSwap("SELL", options);
+  }
+
+  /**
+   * Performs a simulated fill calculation and logs the intention.
+   */
+  private handleDryRun(side: "BUY" | "SELL", options: ExecutionOptions): ExecutionResult {
+    const MOCK_LIQUIDITY = 500_000;
+    const amountUsd = options.amountUsd ?? (options.quantity! * options.marketPrice);
+    
+    // Calculate realistic slippage based on our local math model
+    const estimatedSlippage = SlippageModel.estimateImpact(amountUsd, MOCK_LIQUIDITY);
+    
+    // Adjust price based on side (BUY moves price UP, SELL moves price DOWN)
+    const priceImpact = side === "BUY" ? (1 + estimatedSlippage) : (1 - estimatedSlippage);
+    const filledPrice = options.marketPrice * priceImpact;
+
+    console.log(`\n[DRY RUN] ${side} order logic complete:`);
+    console.log(` > Expected Fill: $${filledPrice.toFixed(6)}`);
+    console.log(` > Est. Slippage: ${(estimatedSlippage * 100).toFixed(4)}%`);
+    console.log(` > Pool Impact:   ${(estimatedSlippage * 10).toFixed(4)}% (Est. Depth: $${MOCK_LIQUIDITY})`);
+
+    return {
+      filledPrice,
+      filledQuantity: amountUsd / filledPrice,
+      slippage: estimatedSlippage,
+      rawTxHash: `DRY_RUN_${side}_${Date.now()}`
     };
+  }
 
-    console.log(`[DRY RUN EXECUTOR] ${action} INITIATED`);
-    console.table(report);
+  /**
+   * Placeholder/Structure for Jupiter V6 Swap Logic.
+   * Note: In a full implementation, this uses fetch to get a serialized 
+   * transaction from Jupiter, signs it with WALLET_PRIVATE_KEY, and sends via RPC.
+   */
+  private async handleLiveSwap(side: "BUY" | "SELL", options: ExecutionOptions): Promise<ExecutionResult> {
+    console.log(`[LIVE] Initializing real ${side} swap for ${options.tokenAddress}...`);
+    
+    /**
+     * LOGIC FLOW:
+     * 1. GET QUOTE: Fetch from ${this.JUP_QUOTE_API}
+     * 2. GET SWAP TX: Fetch from ${this.JUP_SWAP_API} using the quote
+     * 3. SIGN: Use VersionedTransaction from @solana/web3.js
+     * 4. SEND: Dispatch to CONFIG.RPC_URL
+     */
+    
+    // For Pilot Safety, we throw a runtime error if this is called before 
+    // the user has explicitly verified the Jupiter API integration code.
+    throw new Error("Live Swap Integration initialized but requires manual verification of signing logic.");
+  }
 
-    return report;
+  public async estimateSlippage(options: ExecutionOptions): Promise<number> {
+    const MOCK_LIQUIDITY = 500_000;
+    const amountUsd = options.amountUsd ?? (options.quantity! * options.marketPrice);
+    return SlippageModel.estimateImpact(amountUsd, MOCK_LIQUIDITY);
+  }
+
+  public async cancelOrder(orderId: string): Promise<boolean> {
+    console.log(`[ORDER] Cancel requested for ${orderId}`);
+    return true;
   }
 }
-
-// Helper to determine impact limit
-const impactLimitUsd = 200_000 * 0.003; // Mock pool logic
