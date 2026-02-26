@@ -1,9 +1,7 @@
-// 1. Types must use 'import type' for verbatimModuleSyntax
 import type { Candle } from "../types/MarketTypes.js";
 import type { Position, TradeResult } from "../types/TradeTypes.js";
 import type { Regime } from "../core/RegimeEngine.js";
 
-// 2. Logic modules use standard imports with .js extension
 import { EntryEngine } from "../core/EntryEngine.js";
 import { PositionSizer } from "../core/PositionSizer.js";
 import { ExitEngine } from "../core/ExitEngine.js";
@@ -26,24 +24,24 @@ export class ReplayEngine {
     this.riskManager = new PortfolioRiskManager(initialBalance);
   }
 
-  public run(candles: Candle[]): void {
+  public run(candles: Candle[], simBreadth: number = 5): void {
     const LOOKBACK = 6;
 
     for (let i = LOOKBACK; i < candles.length; i++) {
-      // 3. Handle 'noUncheckedIndexedAccess' with explicit check
       const current = candles[i];
       if (!current) continue; 
 
       const slice = candles.slice(i - LOOKBACK, i + 1);
-
-      const regime: Regime = RegimeEngine.calculate(5, this.dailyLosses, 0.04);
+      const regime: Regime = RegimeEngine.calculate(simBreadth, this.dailyLosses, 0.04);
 
       if (this.activePosition) {
+        // 1. Check Stop Loss
         if (current.low <= this.activePosition.stopPrice) {
           this.closePosition(this.activePosition.stopPrice, current.timestamp);
           continue; 
         }
 
+        // 2. Trailing Stop Update
         const updatedPeak = Math.max(this.activePosition.peakPrice, current.high);
         const newStop = ExitEngine.calculateUpdatedStop(
           { ...this.activePosition, peakPrice: updatedPeak },
@@ -54,20 +52,14 @@ export class ReplayEngine {
           current.timestamp
         );
 
-        this.activePosition = {
-          ...this.activePosition,
-          peakPrice: updatedPeak,
-          stopPrice: newStop
-        };
+        if (newStop > this.activePosition.stopPrice) {
+          this.activePosition = { ...this.activePosition, peakPrice: updatedPeak, stopPrice: newStop };
+        }
 
-        const scaling = ScalingEngine.evaluate(
-          this.activePosition,
-          current.close,
-          this.portfolio,
-          current.liquidity
-        );
-
+        // 3. Scaling Logic
+        const scaling = ScalingEngine.evaluate(this.activePosition, current.close, this.portfolio, current.liquidity);
         if (scaling.addQuantity > 0) {
+          console.log(`[SCALING] Stage ${this.activePosition.stage} -> ${scaling.newStage} | Adding: ${scaling.addQuantity.toFixed(2)} units`);
           this.activePosition = {
             ...this.activePosition,
             quantity: this.activePosition.quantity + scaling.addQuantity,
@@ -76,19 +68,15 @@ export class ReplayEngine {
         }
       } 
       
+      // 4. Entry Logic
       if (!this.activePosition && this.riskManager.canTrade()) {
         const signal = EntryEngine.evaluate(slice, regime, 150000);
         
         if (signal.enter) {
-          const sizing = PositionSizer.calculateStage1Size(
-            this.portfolio,
-            this.riskPercent,
-            current.close,
-            current.close * 0.90,
-            current.liquidity
-          );
+          const sizing = PositionSizer.calculateStage1Size(this.portfolio, this.riskPercent, current.close, current.close * 0.90, current.liquidity);
 
           if (!sizing.rejected && sizing.quantity > 0) {
+            console.log(`[ENTRY] Stage 1 | Price: ${current.close} | Qty: ${sizing.quantity.toFixed(2)} | Slippage: ${(sizing.expectedSlippage * 100).toFixed(4)}%`);
             this.activePosition = {
               entryPrice: current.close,
               quantity: sizing.quantity,
@@ -106,45 +94,32 @@ export class ReplayEngine {
 
   private closePosition(exitPrice: number, exitTime: number): void {
     if (!this.activePosition) return;
-
     const pnl = (exitPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
     const rMultiple = pnl / this.activePosition.riskAmount;
 
-    const result: TradeResult = {
+    console.log(`[EXIT] Price: ${exitPrice.toFixed(2)} | PnL: $${pnl.toFixed(2)} | R: ${rMultiple.toFixed(2)}`);
+
+    this.history.push({
       entryPrice: this.activePosition.entryPrice,
       exitPrice: exitPrice,
       Rmultiple: rMultiple,
       duration: exitTime - this.activePosition.openTime,
       maxFavorableExcursion: this.activePosition.peakPrice / this.activePosition.entryPrice,
       maxAdverseExcursion: 0 
-    };
+    });
 
-    this.history.push(result);
     this.portfolio += pnl;
     this.riskManager.updatePnL(pnl);
-    
-    if (pnl < 0) this.dailyLosses++;
-    else this.dailyLosses = 0;
-
+    this.dailyLosses = pnl < 0 ? this.dailyLosses + 1 : 0;
     this.activePosition = null;
   }
 
   public getStats() {
-    const wins = this.history.filter(h => h.Rmultiple > 0);
-    const losses = this.history.filter(h => h.Rmultiple <= 0);
-    const winRate = (wins.length / this.history.length) || 0;
-    
-    // Constant for simulation visualization
-    const R_UNIT_USD = 15;
-    const grossProfit = wins.reduce((sum, h) => sum + (h.Rmultiple * R_UNIT_USD), 0);
-    const grossLoss = Math.abs(losses.reduce((sum, h) => sum + (h.Rmultiple * R_UNIT_USD), 0));
-
+    const totalR = this.history.reduce((sum, h) => sum + h.Rmultiple, 0);
     return {
       finalBalance: this.portfolio,
-      winRate: winRate * 100,
       totalTrades: this.history.length,
-      profitFactor: grossLoss === 0 ? grossProfit : grossProfit / grossLoss,
-      expectancyR: this.history.length === 0 ? 0 : this.history.reduce((sum, h) => sum + h.Rmultiple, 0) / this.history.length
+      expectancyR: this.history.length === 0 ? 0 : totalR / this.history.length
     };
   }
 }
