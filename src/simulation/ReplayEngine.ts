@@ -126,26 +126,20 @@ export class ReplayEngine {
   /**
    * Finalizes trade with Atomic Partitioning Tax simulation
    */
-  private closePosition(exitPrice: number, exitTime: number): void {
+ private closePosition(exitPrice: number, exitTime: number): void {
     if (!this.activePosition) return;
 
-    // Simulate "Partitioning Tax" for Stage 3 exits (0.2% price drag)
-    const executionPrice = this.activePosition.stage === 3 
-      ? exitPrice * 0.998 
-      : exitPrice;
-
-    const pnl = (executionPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
+    const pnl = (exitPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
     const rMultiple = pnl / this.activePosition.riskAmount;
-
-    console.log(`[EXIT] Stage: ${this.activePosition.stage} | Price: ${executionPrice.toFixed(4)} | R: ${rMultiple.toFixed(2)}`);
 
     this.history.push({
       entryPrice: this.activePosition.entryPrice,
-      exitPrice: executionPrice,
+      exitPrice: exitPrice,
       Rmultiple: rMultiple,
       duration: exitTime - this.activePosition.openTime,
       maxFavorableExcursion: this.activePosition.peakPrice / this.activePosition.entryPrice,
-      maxAdverseExcursion: 0 
+      maxAdverseExcursion: 0,
+      stageReached: this.activePosition.stage // Capture the final stage before closing
     });
 
     this.portfolio += pnl;

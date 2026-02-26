@@ -1,65 +1,95 @@
 import type { TradeResult } from "../types/TradeTypes.js";
 
-export interface LoggedTrade extends TradeResult {
-  readonly assumedSlippage: number;
-  readonly realizedSlippage: number;
+/**
+ * RobustnessMetrics provides a deep-dive into the strategy performance
+ * across different market regimes.
+ */
+export interface RobustnessMetrics {
+  readonly datasetName: string;
+  readonly winRate: number;
+  readonly profitFactor: number;
+  readonly totalNetR: number;
+  readonly avgWinnerR: number;
+  readonly avgLoserR: number;
+  readonly maxDrawdownPercent: number;
+  readonly stage2ProgressionRate: number;
+  readonly stage3ProgressionRate: number;
 }
 
 export class TradeLogger {
-  private logs: LoggedTrade[] = [];
+  private logs: Map<string, any[]> = new Map();
 
-  public logTrade(result: TradeResult, assumedSlippage: number, realizedSlippage: number): void {
-    this.logs.push({
-      ...result,
-      assumedSlippage,
-      realizedSlippage
-    });
+  public logTrade(datasetName: string, result: TradeResult & { stageReached: number }): void {
+    const datasetLogs = this.logs.get(datasetName) || [];
+    datasetLogs.push(result);
+    this.logs.set(datasetName, datasetLogs);
   }
 
-  public getStats() {
-    if (this.logs.length === 0) return null;
+  public getRobustnessReport(datasetName: string, startingBalance: number): RobustnessMetrics {
+    const trades = this.logs.get(datasetName) || [];
+    if (trades.length === 0) {
+      return { datasetName, winRate: 0, profitFactor: 0, totalNetR: 0, avgWinnerR: 0, avgLoserR: 0, maxDrawdownPercent: 0, stage2ProgressionRate: 0, stage3ProgressionRate: 0 };
+    }
 
-    const wins = this.logs.filter(l => l.Rmultiple > 0);
-    const totalR = this.logs.reduce((sum, l) => sum + l.Rmultiple, 0);
-    const avgDuration = this.logs.reduce((sum, l) => sum + l.duration, 0) / this.logs.length;
-    
-    const slippageDeviation = this.logs.reduce((sum, l) => 
-      sum + (l.realizedSlippage - l.assumedSlippage), 0) / this.logs.length;
+    const wins = trades.filter(t => t.Rmultiple > 0);
+    const losses = trades.filter(t => t.Rmultiple <= 0);
+
+    const grossProfitR = wins.reduce((sum, t) => sum + t.Rmultiple, 0);
+    const grossLossR = Math.abs(losses.reduce((sum, t) => sum + t.Rmultiple, 0));
+
+    // Calculate Max Drawdown (Portfolio Level)
+    let peak = startingBalance;
+    let currentBal = startingBalance;
+    let maxDD = 0;
+
+    trades.forEach(t => {
+      // Assuming 1R = 1.5% of $1000 = $15 for simulation tracking
+      const pnlUsd = t.Rmultiple * 15;
+      currentBal += pnlUsd;
+      if (currentBal > peak) peak = currentBal;
+      const dd = (peak - currentBal) / peak;
+      if (dd > maxDD) maxDD = dd;
+    });
 
     return {
-      totalTrades: this.logs.length,
-      winRate: (wins.length / this.logs.length) * 100,
-      expectancyR: totalR / this.logs.length,
-      totalNetR: totalR,
-      avgMFE: this.logs.reduce((sum, l) => sum + l.maxFavorableExcursion, 0) / this.logs.length,
-      avgDurationMinutes: avgDuration / 60000,
-      slippageLeakageBps: slippageDeviation * 10000 
+      datasetName,
+      winRate: (wins.length / trades.length) * 100,
+      profitFactor: grossLossR === 0 ? grossProfitR : grossProfitR / grossLossR,
+      totalNetR: trades.reduce((sum, t) => sum + t.Rmultiple, 0),
+      avgWinnerR: wins.length > 0 ? grossProfitR / wins.length : 0,
+      avgLoserR: losses.length > 0 ? grossLossR / losses.length : 0,
+      maxDrawdownPercent: maxDD * 100,
+      stage2ProgressionRate: (trades.filter(t => t.stageReached >= 2).length / trades.length) * 100,
+      stage3ProgressionRate: (trades.filter(t => t.stageReached >= 3).length / trades.length) * 100
     };
   }
 
-  public printSummary(): void {
-    const stats = this.getStats();
-    if (!stats) return;
+  public printComparisonTable(reports: RobustnessMetrics[]): void {
+    console.log("\n" + "=".repeat(105));
+    console.log(
+      "DATASET".padEnd(20) + 
+      "WIN%".padEnd(10) + 
+      "PF".padEnd(10) + 
+      "NET R".padEnd(12) + 
+      "AVG WIN R".padEnd(12) + 
+      "MAX DD%".padEnd(12) + 
+      "S2 RATE%".padEnd(10) + 
+      "S3 RATE%"
+    );
+    console.log("-".repeat(105));
 
-    console.log("==========================================");
-    console.log(`Total Trades:       ${stats.totalTrades}`);
-    console.log(`Win Rate:           ${stats.winRate.toFixed(2)}%`);
-    console.log(`Net Profit (R):     ${stats.totalNetR.toFixed(2)}R`);
-    console.log("==========================================");
+    reports.forEach(r => {
+      console.log(
+        r.datasetName.padEnd(20) + 
+        r.winRate.toFixed(1).padEnd(10) + 
+        r.profitFactor.toFixed(2).padEnd(10) + 
+        r.totalNetR.toFixed(2).padEnd(12) + 
+        r.avgWinnerR.toFixed(2).padEnd(12) + 
+        r.maxDrawdownPercent.toFixed(2).padEnd(12) + 
+        r.stage2ProgressionRate.toFixed(1).padEnd(10) + 
+        r.stage3ProgressionRate.toFixed(1)
+      );
+    });
+    console.log("=".repeat(105) + "\n");
   }
 }
-/**
- * MOCK USAGE EXAMPLE
- * 
- * const logger = new TradeLogger();
- * logger.logTrade({
- *   entryPrice: 1.0,
- *   exitPrice: 1.2,
- *   Rmultiple: 2.0,
- *   duration: 300000,
- *   maxFavorableExcursion: 1.25,
- *   maxAdverseExcursion: 0.98
- * }, 0.005, 0.006);
- * 
- * logger.printSummary();
- */

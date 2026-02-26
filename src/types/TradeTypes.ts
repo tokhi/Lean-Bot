@@ -23,6 +23,7 @@ export interface TradeResult {
   readonly duration: number;              // Time elapsed between entry and exit
   readonly maxFavorableExcursion: number; // MFE: Highest profit point reached during trade
   readonly maxAdverseExcursion: number;   // MAE: Lowest drawdown point reached during trade
+  readonly stageReached: number;          // robustness tracking
 }
 
 /**

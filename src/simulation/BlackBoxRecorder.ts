@@ -1,4 +1,4 @@
-import * as fs from 'fs';
+import * as fs from 'node:fs';
 
 /**
  * BlackBoxRecorder V2.1
@@ -8,16 +8,17 @@ import * as fs from 'fs';
  * local JSON file for post-mortem analysis.
  */
 export class BlackBoxRecorder {
-  private static LOG_PATH = './trade_logs.json';
+  private static readonly LOG_PATH = './trade_logs.json';
 
   public static record(data: any): void {
     const timestamp = new Date().toISOString();
     const logEntry = { timestamp, ...data };
 
     try {
-      let logs = [];
+      let logs: any[] = [];
       if (fs.existsSync(this.LOG_PATH)) {
-        logs = JSON.parse(fs.readFileSync(this.LOG_PATH, 'utf-8'));
+        const fileContent = fs.readFileSync(this.LOG_PATH, 'utf-8');
+        logs = JSON.parse(fileContent);
       }
       logs.push(logEntry);
       fs.writeFileSync(this.LOG_PATH, JSON.stringify(logs, null, 2));
