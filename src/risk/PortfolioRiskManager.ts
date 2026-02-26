@@ -1,75 +1,53 @@
 /**
- * PortfolioRiskManager serves as the final safety circuit breaker.
- * It tracks intraday performance and prevents over-exposure or catastrophic
- * daily losses by disabling the trading engine when limits are breached.
+ * PortfolioRiskManager V2.1
+ * 
+ * Logic:
+ * 1. Daily Drawdown: Stops all trading if 4% of starting balance is lost.
+ * 2. Portfolio Heat: Limits total active risk (R) across all open positions.
+ * 3. Correlation Cap: Limits the number of concurrent trades (Max 2).
  */
 export class PortfolioRiskManager {
   private readonly dailyStartBalance: number;
   private currentPnL: number = 0;
   private readonly maxDailyDrawdownLimit: number;
+  
+  // Rule 5: Portfolio Heat Limit (Total R at risk across all trades)
+  private readonly MAX_TOTAL_HEAT_R = 4.0; 
+  private readonly MAX_CONCURRENT_TRADES = 2;
 
-  /**
-   * @param initialBalance The portfolio balance at the start of the session.
-   * @param drawdownLimitPercent The max % loss allowed (default 0.04 for 4%).
-   */
   constructor(initialBalance: number, drawdownLimitPercent: number = 0.04) {
     this.dailyStartBalance = initialBalance;
     this.maxDailyDrawdownLimit = initialBalance * drawdownLimitPercent;
   }
 
-  /**
-   * Updates the accumulated daily PnL with the result of a closed trade.
-   * @param amount Positive for profit, negative for loss.
-   */
   public updatePnL(amount: number): void {
     this.currentPnL += amount;
   }
 
   /**
-   * Enforces the 4% daily drawdown rule.
-   * Reasoning:
-   * If current realized losses exceed the limit, the strategy is deemed 
-   * "out of sync" with the market regime, and new risk is prohibited.
+   * Evaluates if the portfolio can accept a new trade.
    * 
-   * @returns boolean - True if trading is permitted.
+   * @param currentActiveTrades - Number of positions currently open
+   * @param totalActiveRiskR - Sum of R-units at risk across open positions
    */
-  public canTrade(): boolean {
+  public canTrade(currentActiveTrades: number, totalActiveRiskR: number): boolean {
+    // 1. Check Daily Drawdown
     const isDrawdownBreached = this.currentPnL <= -this.maxDailyDrawdownLimit;
-    return !isDrawdownBreached;
+    if (isDrawdownBreached) return false;
+
+    // 2. Check Correlation Cap (Rule 5)
+    if (currentActiveTrades >= this.MAX_CONCURRENT_TRADES) return false;
+
+    // 3. Check Portfolio Heat (Rule 5)
+    if (totalActiveRiskR >= this.MAX_TOTAL_HEAT_R) return false;
+
+    return true;
   }
 
-  /**
-   * Returns the current risk status for logging and engine orchestration.
-   */
   public getStatus() {
     return {
       currentPnL: this.currentPnL,
-      limit: -this.maxDailyDrawdownLimit,
-      drawdownPercent: (this.currentPnL / this.dailyStartBalance) * 100,
-      active: this.canTrade()
+      active: this.currentPnL > -this.maxDailyDrawdownLimit
     };
   }
-
-  /**
-   * Resets the PnL tracker (typically called at the start of a new day/session).
-   * For simulation, this is called between discrete test days.
-   */
-  public resetSession(): void {
-    this.currentPnL = 0;
-  }
 }
-
-/**
- * MOCK USAGE EXAMPLE
- * 
- * const riskManager = new PortfolioRiskManager(1000); // $1000 balance, $40 limit
- * 
- * riskManager.updatePnL(-25); // Trade 1 loss
- * console.log(riskManager.canTrade()); // true
- * 
- * riskManager.updatePnL(-20); // Trade 2 loss
- * console.log(riskManager.canTrade()); // false (Total loss $45 > $40)
- * 
- * const status = riskManager.getStatus();
- * // { currentPnL: -45, limit: -40, drawdownPercent: -4.5, active: false }
- */

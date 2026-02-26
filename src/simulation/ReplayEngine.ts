@@ -12,16 +12,16 @@ import { RegimeEngine } from "../core/RegimeEngine.js";
 import { PortfolioRiskManager } from "../risk/PortfolioRiskManager.js";
 
 /**
- * ReplayEngine V2.1
- * Orchestrates deterministic simulation of the Lean Momentum Strategy.
+ * ReplayEngine V2.1 (Production-Ready Simulation)
+ * Orchestrates deterministic simulation with Portfolio Heat and Atomic Partitioning simulation.
  */
 export class ReplayEngine {
   private portfolio: number;
-  private readonly riskPercent: number; // e.g. 0.015 for 1.5%
+  private readonly riskPercent: number;
   private readonly riskManager: PortfolioRiskManager;
   
   private activePosition: Position | null = null;
-  private history: TradeResult[] = [];
+  public history: TradeResult[] = []; // Public for Logger access in Main
   private dailyLosses: number = 0;
 
   constructor(initialBalance: number, riskPercent: number = 0.015) {
@@ -42,31 +42,28 @@ export class ReplayEngine {
 
       const slice = candles.slice(i - LOOKBACK, i + 1);
       
-      // Calculate Market Regime (Safe/Toxic/Chop)
+      // Calculate Market Regime
       const regime: Regime = RegimeEngine.calculate(simBreadth, this.dailyLosses, 0.04);
 
       // --- HANDLE OPEN POSITION ---
       if (this.activePosition) {
-        // 1. Check Technical Stop Loss (Execution at Candle Low)
+        // 1. Check Technical Stop Loss
         if (current.low <= this.activePosition.stopPrice) {
           this.closePosition(this.activePosition.stopPrice, current.timestamp);
           continue; 
         }
 
-        // 2. Peak Update & Exit Engine Trailing (ATR / Parabolic / Velocity)
+        // 2. Trailing Stop Update (ATR / Parabolic / Velocity)
         const updatedPeak = Math.max(this.activePosition.peakPrice, current.high);
-        
-        // ATR multiplier usually 2.0x, but ExitEngine handles internal logic
         const newStop = ExitEngine.calculateUpdatedStop(
           { ...this.activePosition, peakPrice: updatedPeak },
           current.close,
-          current.close * 0.05, // Mock ATR as 5% of price
-          0.04,                 // Mock recent volatility
+          current.close * 0.05, 
+          0.04,                 
           current.liquidity,
           current.timestamp
         );
 
-        // Ratchet Logic: Stop only moves in favor of trade
         if (newStop > this.activePosition.stopPrice) {
           this.activePosition = { 
             ...this.activePosition, 
@@ -75,7 +72,7 @@ export class ReplayEngine {
           };
         }
 
-        // 3. Scaling Engine (Stage 2/3 Asymmetric Pyramiding)
+        // 3. Scaling Engine (Asymmetric Pyramiding)
         const scaling = ScalingEngine.evaluate(
           this.activePosition, 
           current.close, 
@@ -94,16 +91,18 @@ export class ReplayEngine {
       } 
       
       // --- HANDLE NEW ENTRIES ---
-      if (!this.activePosition && this.riskManager.canTrade()) {
+      // Check Portfolio Heat: Current Trades = 0, Active Risk = 0 (for this 1-token sim)
+      const canEnter = !this.activePosition && this.riskManager.canTrade(0, 0);
+
+      if (canEnter) {
         const signal = EntryEngine.evaluate(slice, regime, 150000);
         
         if (signal.enter) {
-          // Calculate Stage 1 "Probe" Size (0.3R or 0.5R based on liquidity)
           const sizing = PositionSizer.calculateStage1Size(
             this.portfolio,
-            this.portfolio * this.riskPercent, // The absolute 1.5% 'R' unit ($15)
+            this.portfolio * this.riskPercent, 
             current.close,
-            current.close * 0.90, // 10% Initial Stop
+            current.close * 0.90,
             current.liquidity
           );
 
@@ -125,19 +124,24 @@ export class ReplayEngine {
   }
 
   /**
-   * Finalizes trade data and updates portfolio balance
+   * Finalizes trade with Atomic Partitioning Tax simulation
    */
   private closePosition(exitPrice: number, exitTime: number): void {
     if (!this.activePosition) return;
 
-    const pnl = (exitPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
+    // Simulate "Partitioning Tax" for Stage 3 exits (0.2% price drag)
+    const executionPrice = this.activePosition.stage === 3 
+      ? exitPrice * 0.998 
+      : exitPrice;
+
+    const pnl = (executionPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
     const rMultiple = pnl / this.activePosition.riskAmount;
 
-    console.log(`[EXIT] Price: ${exitPrice.toFixed(2)} | PnL: $${pnl.toFixed(2)} | R: ${rMultiple.toFixed(2)}`);
+    console.log(`[EXIT] Stage: ${this.activePosition.stage} | Price: ${executionPrice.toFixed(4)} | R: ${rMultiple.toFixed(2)}`);
 
     this.history.push({
       entryPrice: this.activePosition.entryPrice,
-      exitPrice: exitPrice,
+      exitPrice: executionPrice,
       Rmultiple: rMultiple,
       duration: exitTime - this.activePosition.openTime,
       maxFavorableExcursion: this.activePosition.peakPrice / this.activePosition.entryPrice,
@@ -147,16 +151,12 @@ export class ReplayEngine {
     this.portfolio += pnl;
     this.riskManager.updatePnL(pnl);
     
-    // Circuit breaker logic for RegimeEngine
     if (pnl < 0) this.dailyLosses++;
     else this.dailyLosses = 0;
 
     this.activePosition = null;
   }
 
-  /**
-   * Returns simulation performance metrics
-   */
   public getStats() {
     const totalR = this.history.reduce((sum, h) => sum + h.Rmultiple, 0);
     return {
