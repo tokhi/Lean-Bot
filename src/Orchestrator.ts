@@ -15,6 +15,7 @@ import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
 import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
 import { QuoteValidator } from "./execution/QuoteValidator.js";
 import { CONFIG } from "./config.js";
+import { TradeLogger } from "./simulation/TradeLogger.js";
 
 /**
  * Orchestrator V2.1
@@ -213,5 +214,46 @@ export class Orchestrator {
     console.log(`[ORCHESTRATOR] EXIT (${reason}) | Target: ${this.activePosition.stopPrice.toFixed(2)} | Filled: ${result.filledPrice.toFixed(4)} | PnL: $${finalPnl.toFixed(2)}`);
     
     this.activePosition = null;
+  }
+
+  private async recordTradeTelemetry(
+    token: string, 
+    stage: number, 
+    risk: number, 
+    result: any, 
+    current: any, 
+    regime: string
+  ) {
+    const telemetry: any = {
+      timestamp: new Date().toISOString(),
+      token,
+      stage,
+      expectedRisk: risk,
+      jupiterPriceImpact: result.slippage,
+      modeledSlippage: result.slippage, // In Dry Run, these are often linked
+      realSlippageEstimate: result.slippage, 
+      liquidity: current.liquidity,
+      poolImpact: (result.filledQuantity * result.filledPrice) / current.liquidity,
+      regimeState: regime,
+      executionMode: CONFIG.EXECUTION_MODE
+    };
+    
+    TradeLogger.recordTelemetry(telemetry);
+  }
+
+   private async logTelemetry(stage: number, risk: number, result: any, current: Candle, regime: string) {
+    TradeLogger.recordTelemetry({
+      timestamp: new Date().toISOString(),
+      token: "MOCK_TOKEN", // Update to real mint in Phase 4
+      stage: stage,
+      expectedRiskUsd: risk,
+      jupiterPriceImpact: result.slippage,
+      modeledSlippage: result.slippage, // Currently synced in Dry Run
+      realSlippageDelta: 0, // Calculated during post-mortem
+      liquidityUsd: current.liquidity,
+      poolImpactUsd: (result.filledQuantity * result.filledPrice) / current.liquidity,
+      regimeState: regime,
+      executionMode: CONFIG.EXECUTION_MODE
+    });
   }
 }

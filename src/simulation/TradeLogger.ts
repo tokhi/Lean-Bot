@@ -1,4 +1,5 @@
 import type { TradeResult } from "../types/TradeTypes.js";
+import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 
 /**
  * RobustnessMetrics provides a deep-dive into the strategy performance
@@ -14,6 +15,20 @@ export interface RobustnessMetrics {
   readonly maxDrawdownPercent: number;
   readonly stage2ProgressionRate: number;
   readonly stage3ProgressionRate: number;
+}
+
+export interface TradeTelemetry {
+  timestamp: string;
+  token: string;
+  stage: number;
+  expectedRiskUsd: number;
+  jupiterPriceImpact: number;
+  modeledSlippage: number;
+  realSlippageDelta: number;
+  liquidityUsd: number;
+  poolImpactUsd: number;
+  regimeState: string;
+  executionMode: string;
 }
 
 export class TradeLogger {
@@ -98,6 +113,28 @@ export class TradeLogger {
     });
     console.log("=".repeat(105) + "\n");
   }
+
+  public static recordTelemetry(data: TradeTelemetry): void {
+    const LOG_DIR = './logs';
+    const LOG_FILE = `${LOG_DIR}/live_dry_run.json`;
+
+    if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR);
+
+    try {
+      let logs: TradeTelemetry[] = [];
+      if (existsSync(LOG_FILE)) {
+        const content = readFileSync(LOG_FILE, 'utf-8');
+        logs = content ? JSON.parse(content) : [];
+      }
+      
+      logs.push(data);
+      writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+      console.log(`[TELEMETRY] Forensic data saved to ${LOG_FILE}`);
+    } catch (error) {
+      console.error("[TELEMETRY] Log Error:", error);
+    }
+  }
+
   /**
    * Prints advanced metrics for the Mixed Regime validation.
    */
