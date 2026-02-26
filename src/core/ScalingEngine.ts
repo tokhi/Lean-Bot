@@ -69,4 +69,22 @@ export class ScalingEngine {
       newStage: (position.stage + 1) as 2 | 3
     };
   }
+  /**
+   * Atomic Partitioning Logic
+   * Calculates the number of sequential blocks needed to exit a position 
+   * without exceeding a specific slippage threshold per block.
+   */
+  public static calculateExitPartitions(
+    totalPositionUsd: number,
+    poolLiquidity: number,
+    maxImpactPerBlock: number = 0.003 // 0.3% impact limit
+  ): number {
+    const impactLimitUsd = poolLiquidity * maxImpactPerBlock;
+    
+    // Divide total size by what the pool can handle in one block
+    const partitions = Math.ceil(totalPositionUsd / impactLimitUsd);
+    
+    // Ensure at least 1, max 5 (to prevent excessive latency)
+    return Math.max(1, Math.min(partitions, 5));
+  }
 }

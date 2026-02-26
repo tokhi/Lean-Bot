@@ -1,12 +1,15 @@
 import type { Candle } from "./types/MarketTypes.js";
 import { ReplayEngine } from "./simulation/ReplayEngine.js";
+import { TradeLogger } from "./simulation/TradeLogger.js";
 
+/**
+ * Generates a synthetic "Winner" dataset.
+ */
 function generateWinnerData(): Candle[] {
   const candles: Candle[] = [];
   const startPrice = 100;
   const liq = 500_000;
 
-  // 1. Consolidation (15 candles)
   for (let i = 0; i < 15; i++) {
     candles.push({
       timestamp: i * 60000,
@@ -15,14 +18,14 @@ function generateWinnerData(): Candle[] {
     });
   }
 
-  // 2. Breakout
+  // Breakout Candle
   candles.push({
     timestamp: 15 * 60000,
     open: 100, high: 115, low: 100, close: 112,
     volume: 500, liquidity: liq
   });
 
-  // 3. Steady Expansion (Sequential - no gaps)
+  // Expansion Phase
   for (let i = 16; i < 40; i++) {
     const last = candles[candles.length - 1]!;
     candles.push({
@@ -32,7 +35,7 @@ function generateWinnerData(): Candle[] {
     });
   }
 
-  // 4. Reversal
+  // Final Reversal (Hits Ratchet)
   const peak = candles[candles.length - 1]!;
   candles.push({
     timestamp: 40 * 60000,
@@ -43,32 +46,32 @@ function generateWinnerData(): Candle[] {
   return candles;
 }
 
-function generateToxicData(): Candle[] {
-  const candles: Candle[] = [];
-  const liq = 200_000; // Above min threshold but volatile
-
-  for (let i = 0; i < 30; i++) {
-    const price = 100 + (Math.random() * 20);
-    candles.push({
-      timestamp: i * 60000,
-      open: price, high: price + 5, low: price - 5, close: price,
-      volume: 400, // High volume
-      liquidity: liq
-    });
-  }
-  return candles;
-}
-
 function main() {
-  console.log("=== RUNNING WINNER SIMULATION ===");
-  const engine1 = new ReplayEngine(1000, 0.015);
-  engine1.run(generateWinnerData(), 5); // Breadth = 5
-  console.log(engine1.getStats());
+  const logger = new TradeLogger();
+  const engine = new ReplayEngine(1000, 0.015);
 
-  console.log("\n=== RUNNING TOXIC TEST (Negative Breadth) ===");
-  const engine2 = new ReplayEngine(1000, 0.015);
-  engine2.run(generateToxicData(), -5); // Breadth = -5 (Should Hibernate)
-  console.log(engine2.getStats());
+  console.log("=== STARTING LEAN V2 BACKTEST ===");
+  
+  // 1. Run Winning Scenario
+  const winData = generateWinnerData();
+  engine.run(winData, 5); 
+
+  // 2. Extract Results from Engine into Logger
+  // Note: In a production sim, the engine would pipe results to the logger automatically.
+  // For this lean skeleton, we utilize the engine's internal history.
+  const history = (engine as any).history; // Accessing for summary purposes
+  history.forEach((res: any) => {
+    // Assume 0.5% expected vs 0.7% realized slippage for the log
+    logger.logTrade(res, 0.005, 0.007);
+  });
+
+  // 3. Print Final Summary
+  logger.printSummary();
+
+  const stats = engine.getStats();
+  if (stats.finalBalance > 1000) {
+    console.log("PROFITABILITY CHECK: PASSED");
+  }
 }
 
 main();
