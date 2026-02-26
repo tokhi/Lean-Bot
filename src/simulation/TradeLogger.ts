@@ -19,9 +19,15 @@ export interface RobustnessMetrics {
 export class TradeLogger {
   private logs: Map<string, any[]> = new Map();
 
-  public logTrade(datasetName: string, result: TradeResult & { stageReached: number }): void {
+  public logTrade(datasetName: string, result: any): void {
     const datasetLogs = this.logs.get(datasetName) || [];
-    datasetLogs.push(result);
+    // Ensure realizedSlippage is never NaN
+    const sanitizedResult = {
+      ...result,
+      realizedSlippage: result.realizedSlippage || 0.005, // Default to 50bps if missing
+      stageReached: result.stageReached || 1
+    };
+    datasetLogs.push(sanitizedResult);
     this.logs.set(datasetName, datasetLogs);
   }
 
@@ -91,5 +97,52 @@ export class TradeLogger {
       );
     });
     console.log("=".repeat(105) + "\n");
+  }
+  /**
+   * Prints advanced metrics for the Mixed Regime validation.
+   */
+  public printDetailedMetrics(datasetName: string, startingBalance: number): void {
+    const trades = this.logs.get(datasetName) || [];
+    if (trades.length === 0) return;
+
+    let peakEquity = startingBalance;
+    let currentEquity = startingBalance;
+    let totalSlippage = 0;
+    let maxConsecutiveLosses = 0;
+    let currentLossStreak = 0;
+    
+    const distribution = { stopOut: 0, smallWin: 0, runner: 0, massive: 0 };
+
+    trades.forEach(t => {
+      // 1. R Distribution
+      if (t.Rmultiple <= 0) distribution.stopOut++;
+      else if (t.Rmultiple < 2) distribution.smallWin++;
+      else if (t.Rmultiple < 5) distribution.runner++;
+      else distribution.massive++;
+
+      // 2. Slippage & Equity
+      totalSlippage += t.realizedSlippage;
+      currentEquity += (t.Rmultiple * 15); // Using $15 as R unit
+      if (currentEquity > peakEquity) peakEquity = currentEquity;
+
+      // 3. Loss Streak
+      if (t.Rmultiple <= 0) {
+        currentLossStreak++;
+        if (currentLossStreak > maxConsecutiveLosses) maxConsecutiveLosses = currentLossStreak;
+      } else {
+        currentLossStreak = 0;
+      }
+    });
+
+    console.log(`--- DETAILED METRICS: ${datasetName} ---`);
+    console.log(`Peak Portfolio Equity:     $${peakEquity.toFixed(2)}`);
+    console.log(`Total Slippage Accrued:    ${(totalSlippage * 100).toFixed(4)}%`);
+    console.log(`Max Consecutive Losses:    ${maxConsecutiveLosses}`);
+    console.log(`R Distribution:`);
+    console.log(`  [<= 0R]  (Stops):        ${distribution.stopOut}`);
+    console.log(`  [0-2R]   (Small):        ${distribution.smallWin}`);
+    console.log(`  [2-5R]   (Runners):      ${distribution.runner}`);
+    console.log(`  [> 5R]   (Massive):      ${distribution.massive}`);
+    console.log("------------------------------------------\n");
   }
 }

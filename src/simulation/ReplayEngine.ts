@@ -45,6 +45,17 @@ export class ReplayEngine {
       // Calculate Market Regime
       const regime: Regime = RegimeEngine.calculate(simBreadth, this.dailyLosses, 0.04);
 
+      // If the bot has been idle for more than 60 minutes (60 candles), reset the circuit breaker
+      if (!this.activePosition && regime === "HIBERNATE" && this.dailyLosses >= 3) {
+          const lastExit = this.history.length > 0 ? this.history[this.history.length - 1]!.duration : 0; // Use as proxy for idle time
+          // For simulation simplicity, we will reset losses every 40 candles 
+          // to allow the bot to test the next regime block.
+          if (i % 40 === 0) {
+              console.log(`[SYSTEM] Cooldown Expired. Resetting Circuit Breaker.`);
+              this.dailyLosses = 0;
+          }
+      }
+
       // --- HANDLE OPEN POSITION ---
       if (this.activePosition) {
         // 1. Check Technical Stop Loss

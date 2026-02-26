@@ -1,11 +1,8 @@
-import * as fs from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 /**
  * BlackBoxRecorder V2.1
- * 
- * Logic:
- * Saves every trade decision, slippage audit, and PnL outcome to a 
- * local JSON file for post-mortem analysis.
+ * Handles deterministic logging of trade events to a local file.
  */
 export class BlackBoxRecorder {
   private static readonly LOG_PATH = './trade_logs.json';
@@ -16,15 +13,17 @@ export class BlackBoxRecorder {
 
     try {
       let logs: any[] = [];
-      if (fs.existsSync(this.LOG_PATH)) {
-        const fileContent = fs.readFileSync(this.LOG_PATH, 'utf-8');
-        logs = JSON.parse(fileContent);
+      
+      if (existsSync(this.LOG_PATH)) {
+        const fileContent = readFileSync(this.LOG_PATH, 'utf-8');
+        logs = fileContent ? JSON.parse(fileContent) : [];
       }
+      
       logs.push(logEntry);
-      fs.writeFileSync(this.LOG_PATH, JSON.stringify(logs, null, 2));
-      console.log(`[BLACKBOX] Trade data persisted to ${this.LOG_PATH}`);
+      writeFileSync(this.LOG_PATH, JSON.stringify(logs, null, 2));
+      console.log(`[BLACKBOX] Snapshot persisted to ${this.LOG_PATH}`);
     } catch (error) {
-      console.error("[BLACKBOX] Failed to save logs:", error);
+      console.error("[BLACKBOX] Write Error:", error);
     }
   }
 }
