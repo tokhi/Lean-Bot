@@ -24,3 +24,15 @@ export interface TradeResult {
   readonly maxFavorableExcursion: number; // MFE: Highest profit point reached during trade
   readonly maxAdverseExcursion: number;   // MAE: Lowest drawdown point reached during trade
 }
+
+/**
+ * ExecutionReport captures the details of a dry-run or live transaction.
+ */
+export interface ExecutionReport {
+  readonly timestamp: number;
+  readonly action: string;
+  readonly tokenAddress: string;
+  readonly totalValueUsd: string;
+  readonly atomicChunks: number;
+  readonly jitoTipSol: number;
+}
