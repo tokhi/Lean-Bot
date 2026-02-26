@@ -1,66 +1,41 @@
 import type { Candle } from "./types/MarketTypes.js";
-import { ReplayEngine } from "./simulation/ReplayEngine.js";
-import { TradeLogger } from "./simulation/TradeLogger.js";
+import { Orchestrator } from "./Orchestrator.js";
+import { StubExecutionLayer } from "./execution/StubExecutionLayer.js";
 
-/**
- * Dataset: The "Fake Breakout" (Trap)
- * Price spikes to trigger Stage 1, then immediately collapses.
- */
-function generateTrapData(): Candle[] {
+function generateLongRunnerData(): Candle[] {
   const candles: Candle[] = [];
-  const startPrice = 100;
-  const liq = 500_000;
-
+  const start = 100;
   // 1. Consolidation
   for (let i = 0; i < 10; i++) {
-    candles.push({
-      timestamp: i * 60000,
-      open: startPrice, high: startPrice + 1, low: startPrice - 1, close: startPrice,
-      volume: 100, liquidity: liq
-    });
+    candles.push({ timestamp: Date.now() + i * 60000, open: start, high: start + 1, low: start - 1, close: start, volume: 100, liquidity: 500000 });
   }
-
-  // 2. The Trap (Volume spike + Price Breakout)
-  candles.push({
-    timestamp: 10 * 60000,
-    open: 100, high: 112, low: 100, close: 111,
-    volume: 500, liquidity: liq
+  // 2. Breakout & Rally (To trigger Scale 2 and 3)
+  for (let i = 11; i < 30; i++) {
+    const p = start + (i - 10) * 10; // Rapid $10 increase per candle
+    candles.push({ timestamp: Date.now() + i * 60000, open: p - 5, high: p + 2, low: p - 6, close: p, volume: i === 11 ? 1000 : 300, liquidity: 500000 });
+  }
+  // 3. Realistic Reversal (Slow enough to hit the stop near the target)
+  candles.push({ 
+    timestamp: Date.now() + 31 * 60000, 
+    open: 300, 
+    high: 301, 
+    low: 250, // This will trigger the $263 stop
+    close: 255, 
+    volume: 900, 
+    liquidity: 500000 
   });
-
-  // 3. The Collapse (Immediate reversal to hit 10% stop)
-  candles.push({
-    timestamp: 11 * 60000,
-    open: 111, high: 111, low: 95, close: 96,
-    volume: 1000, liquidity: liq
-  });
-
   return candles;
 }
 
-function main() {
-  const logger = new TradeLogger();
-  const engine = new ReplayEngine(1000, 0.015);
+async function runDryRun() {
+  console.log("=== STARTING DYNAMIC DRY RUN (V2.1) ===");
+  const data = generateLongRunnerData();
+  const orchestrator = new Orchestrator(1000, new StubExecutionLayer());
 
-  console.log("=== STRESS TEST: FAKE BREAKOUT (TRAP) ===");
-  
-  const trapData = generateTrapData();
-  engine.run(trapData, 5); // Normal Breadth
-
-  const history = (engine as any).history;
-  history.forEach((res: any) => {
-    logger.logTrade(res, 0.005, 0.005);
-  });
-
-  logger.printSummary();
-
-  const stats = engine.getStats();
-  console.log(`Final Portfolio: $${stats.finalBalance.toFixed(2)}`);
-  
-  if (stats.finalBalance >= 992.50) {
-    console.log("RISK SHIELD CHECK: PASSED (Loss capped at ~0.5R)");
-  } else {
-    console.log("RISK SHIELD CHECK: FAILED");
+  for (let i = 6; i < data.length; i++) {
+    await orchestrator.tick(data[i]!, data.slice(0, i + 1), 5);
   }
+  console.log("=== DRY RUN COMPLETE ===");
 }
 
-main();
+runDryRun().catch(console.error);

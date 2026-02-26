@@ -16,6 +16,7 @@ export interface ExecutionOptions {
   readonly amountUsd?: number;
   readonly quantity?: number;
   readonly slippageTolerance: number;
+  readonly marketPrice: number; // ADD THIS FIELD
 }
 
 /**

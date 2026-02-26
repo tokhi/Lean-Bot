@@ -28,13 +28,14 @@ export class ExitEngine {
       return currentPrice;
     }
 
-    // 2. Standard ATR Ratchet (2.0x Multiplier)
+    // 2. ATR Stop: 2.0x ATR below the PEAK
     const baseAtrStop = position.peakPrice - (atr * 2.0);
 
-    // 3. Parabolic Override (Step 3 logic)
+    // 3. Parabolic Stop: 15% below the PEAK
     let parabolicStop = 0;
-    if (priceGain >= 0.30 && timeElapsed <= 30 * 60 * 1000) {
-      parabolicStop = position.peakPrice * 0.85;
+     // Trigger if gain > 30%
+    if (priceGain >= 0.30) {
+      parabolicStop = position.peakPrice * 0.85; 
     }
 
     // Return tightest (highest) stop, ensuring it only moves up
