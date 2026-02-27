@@ -1,3 +1,4 @@
+import { CONFIG } from "./config.js";
 import type { Candle } from "./types/MarketTypes.js";
 import type { Position } from "./types/TradeTypes.js";
 import type { IExecutionLayer } from "./execution/interfaces/IExecutionLayer.js";
@@ -9,34 +10,23 @@ import { PositionSizer } from "./core/PositionSizer.js";
 import { ExitEngine } from "./core/ExitEngine.js";
 import { ScalingEngine } from "./core/ScalingEngine.js";
 
-// Risk and Infrastructure Imports
+// Infrastructure Imports
 import { PortfolioRiskManager } from "./risk/PortfolioRiskManager.js";
 import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
 import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
 import { QuoteValidator } from "./execution/QuoteValidator.js";
-import { CONFIG } from "./config.js";
-import { TradeLogger } from "./simulation/TradeLogger.js";
 
-/**
- * Orchestrator V2.1
- * 
- * Central controller that bridges the deterministic core logic
- * with the asynchronous execution layer.
- */
 export class Orchestrator {
   private activePosition: Position | null = null;
+  private isProcessingExit: boolean = false; // Race condition lock
   private readonly riskManager: PortfolioRiskManager;
   private readonly executionLayer: IExecutionLayer;
   private readonly liqMonitor: LiquidityMonitor;
   private readonly auditor: ExecutionAuditor;
-  private readonly riskPercent: number;
   private readonly initialBalance: number;
+  private readonly riskPercent: number;
 
-  constructor(
-    initialBalance: number, 
-    executionLayer: IExecutionLayer, 
-    riskPercent: number = 0.015
-  ) {
+  constructor(initialBalance: number, executionLayer: IExecutionLayer, riskPercent: number = 0.015) {
     this.initialBalance = initialBalance;
     this.riskManager = new PortfolioRiskManager(initialBalance);
     this.executionLayer = executionLayer;
@@ -46,214 +36,145 @@ export class Orchestrator {
   }
 
   /**
-   * Main entry point for market updates.
+   * 1) STRATEGIC LOOP (Runs every 60s)
+   * Handles: Candle Rolling, Regime, Entry, and Scaling.
    */
   public async tick(current: Candle, history: Candle[], breadthScore: number): Promise<void> {
+    if (this.isProcessingExit) return;
+
     const regime = RegimeEngine.calculate(breadthScore, 0, 0.04);
 
-    // 1. EMERGENCY KILL-SWITCH
-    if (this.activePosition && this.liqMonitor.shouldEmergencyExit(current.liquidity)) {
-      console.error("!!! EMERGENCY LIQUIDITY EXIT TRIGGERED !!!");
-      await this.closePosition(current, "EMERGENCY_EXIT");
-      return;
-    }
-
-    // 2. STATE MACHINE
     if (this.activePosition) {
-      await this.managePosition(current, regime);
-    } else if (this.riskManager.canTrade(0, 0)) {
+      await this.manageStrategicScaling(current);
+    } else {
       await this.evaluateEntry(current, history, regime);
     }
   }
 
   /**
-   * Handles logic for an open trade: Exits, Scaling, and Stop Ratcheting.
+   * 2) SAFETY LOOP (Runs every 3s)
+   * Handles: Instant Stop-Loss, Liquidity Floor, and Daily Drawdown breaches.
    */
- private async managePosition(current: Candle, regime: string): Promise<void> {
-    if (!this.activePosition) return;
+  public async monitorSafety(currentPrice: number, currentLiquidity: number): Promise<void> {
+    if (!this.activePosition || this.isProcessingExit) return;
 
-    // 1. ALWAYS UPDATE PEAK PRICE FIRST
-    const updatedPeak = Math.max(this.activePosition.peakPrice, current.high);
-    
-    // Create a temporary updated position to pass to engines
-    const trackedPosition = { ...this.activePosition, peakPrice: updatedPeak };
-
-    // 2. CHECK EXIT
-    if (current.low <= trackedPosition.stopPrice) {
-      await this.closePosition(current, "STOP_LOSS");
+    // A. Check Daily Drawdown Breach
+    if (!this.riskManager.canTrade(1, 1.0)) {
+      console.log(`[SAFETY EXIT] Daily Drawdown Limit Breached.`);
+      await this.closePosition(currentPrice, "DAILY_DRAWDOWN_OVERRIDE");
       return;
     }
 
-    // 3. CALC NEW STOP (ATR / PARABOLIC)
-    const newStop = ExitEngine.calculateUpdatedStop(
-      trackedPosition, 
-      current.close, 
-      current.close * 0.05, // ATR (5% of price)
-      0.04, 
-      current.liquidity, 
-      current.timestamp
-    );
+    // B. Check Instant Liquidity Floor
+    if (currentLiquidity < CONFIG.MIN_LIQUIDITY_USD) {
+      console.log(`[SAFETY EXIT] Liquidity fell below $${CONFIG.MIN_LIQUIDITY_USD}.`);
+      await this.closePosition(currentPrice, "LIQUIDITY_FLOOR_OVERRIDE");
+      return;
+    }
 
-    // 4. RATCHET STOP (ONLY UP)
-    const finalStop = Math.max(trackedPosition.stopPrice, newStop);
+    // C. Instant Rug/Liquidity Drop Check
+    if (this.liqMonitor.shouldEmergencyExit(currentLiquidity)) {
+      console.log(`[SAFETY EXIT] Rapid Liquidity Drop Detected.`);
+      await this.closePosition(currentPrice, "LIQUIDITY_RUG_OVERRIDE");
+      return;
+    }
 
-    // 5. UPDATE STATE
-    this.activePosition = { 
-      ...trackedPosition, 
-      stopPrice: finalStop 
-    };
+    // D. Instant Price Stop Check
+    if (currentPrice <= this.activePosition.stopPrice) {
+      console.log(`[SAFETY EXIT] Stop Loss Hit at $${currentPrice}.`);
+      await this.closePosition(currentPrice, "FAST_STOP_LOSS");
+      return;
+    }
 
-    // 6. SCALING LOGIC (Remains the same)
+    // Update internal peak price if ticker is higher (improves ratchet accuracy)
+    if (currentPrice > this.activePosition.peakPrice) {
+      this.activePosition = { ...this.activePosition, peakPrice: currentPrice };
+    }
+  }
+
+  private async manageStrategicScaling(current: Candle): Promise<void> {
     const currentBalance = this.initialBalance + this.riskManager.getStatus().currentPnL;
-    const scaling = ScalingEngine.evaluate(this.activePosition, current.close, currentBalance, current.liquidity);
+    const scaling = ScalingEngine.evaluate(this.activePosition!, current.close, currentBalance, current.liquidity);
     
     if (scaling.addQuantity > 0) {
       const result = await this.executionLayer.executeBuy({
         tokenAddress: "MOCK_TOKEN",
         amountUsd: scaling.addQuantity * current.close,
-        slippageTolerance: 0.015,
+        slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000,
         marketPrice: current.close
       });
       this.auditor.auditExecution(current.close, result);
       this.activePosition = { 
-        ...this.activePosition, 
-        quantity: this.activePosition.quantity + result.filledQuantity, 
+        ...this.activePosition!, 
+        quantity: this.activePosition!.quantity + result.filledQuantity, 
         stage: scaling.newStage as 1 | 2 | 3 
       };
       console.log(`[ORCHESTRATOR] SCALE -> Stage ${scaling.newStage}`);
     }
 
-    const unrealizedPnl = (current.close - this.activePosition.entryPrice) * this.activePosition.quantity;
-    console.log(`[MONITOR] Stage: ${this.activePosition.stage} | PnL: $${unrealizedPnl.toFixed(2)} | Stop: ${this.activePosition.stopPrice.toFixed(2)}`);
+    // Update stop ratchet every minute based on candle ATR
+    const newStop = ExitEngine.calculateUpdatedStop(this.activePosition!, current.close, current.close * 0.05, 0.04, current.liquidity, Date.now());
+    if (newStop > this.activePosition!.stopPrice) {
+      this.activePosition = { ...this.activePosition!, stopPrice: newStop };
+    }
   }
 
-  /**
-   * Handles logic for finding and entering a new trade.
-   */
   private async evaluateEntry(current: Candle, history: Candle[], regime: any): Promise<void> {
+    if (!this.riskManager.canTrade(0, 0)) return;
+
     const signal = EntryEngine.evaluate(history, regime, CONFIG.MIN_LIQUIDITY_USD);
+     // Log the engine's reasoning every minute
+    if (!signal.enter) {
+        console.log(`[ANALYSIS] ${signal.reason}`);
+        return; 
+    }
     
     if (signal.enter) {
       const currentBalance = this.initialBalance + this.riskManager.getStatus().currentPnL;
-      
-      const sizing = PositionSizer.calculateStage1Size(
-        currentBalance, 
-        currentBalance * this.riskPercent, 
-        current.close, 
-        current.close * 0.90, 
-        current.liquidity
-      );
+      const sizing = PositionSizer.calculateStage1Size(currentBalance, currentBalance * this.riskPercent, current.close, current.close * 0.90, current.liquidity);
 
       if (!sizing.rejected && sizing.quantity > 0) {
-        // --- V2.1 FIREWALL INTEGRATION ---
-        
-        // 1. Calculate stats for Risk Manager
-        const currentActiveCount = this.activePosition ? 1 : 0;
-        const currentActiveRiskR = this.activePosition ? 1.0 : 0; // Simplified for single trade
-
-        // 2. Run Quote Validator (The Pre-Trade Firewall)
         const validation = QuoteValidator.validate({
           amountUsd: sizing.quantity * current.close,
           poolLiquidity: current.liquidity,
           slippageEstimate: sizing.expectedSlippage,
-          isRiskActive: this.riskManager.canTrade(currentActiveCount, currentActiveRiskR)
+          isRiskActive: true
         });
 
-        if (!validation.valid) {
-          console.log(`[VALIDATOR] Entry Blocked: ${validation.reason}`);
-          return;
-        }
+        if (!validation.valid) return;
 
-        // 3. Execution (If validated)
         const result = await this.executionLayer.executeBuy({ 
-          tokenAddress: "MOCK_TOKEN", 
-          amountUsd: sizing.quantity * current.close, 
-          slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000,
-          marketPrice: current.close 
+          tokenAddress: "MOCK_TOKEN", amountUsd: sizing.quantity * current.close, 
+          slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000, marketPrice: current.close 
         });
 
-        this.auditor.auditExecution(current.close, result);
-        
         this.activePosition = { 
-          entryPrice: result.filledPrice, 
-          quantity: result.filledQuantity, 
-          stopPrice: result.filledPrice * 0.90, 
-          stage: 1, 
-          riskAmount: sizing.effectiveRisk, 
-          peakPrice: result.filledPrice, 
-          openTime: current.timestamp 
+          entryPrice: result.filledPrice, quantity: result.filledQuantity, 
+          stopPrice: result.filledPrice * 0.90, stage: 1, 
+          riskAmount: sizing.effectiveRisk, peakPrice: result.filledPrice, openTime: Date.now() 
         };
-        
         console.log(`[ORCHESTRATOR] ENTRY Stage 1 | Price: ${result.filledPrice.toFixed(4)}`);
       }
     }
   }
 
-  /**
-   * Handles logic for closing a position.
-   */
- private async closePosition(current: Candle, reason: string): Promise<void> {
-    if (!this.activePosition) return;
-
-    // Use the stopPrice as the target, or the current low if the market gapped below it
-    const targetExitPrice = Math.min(this.activePosition.stopPrice, current.high);
-
-    const result = await this.executionLayer.executeSell({ 
-      tokenAddress: "MOCK_TOKEN", 
-      quantity: this.activePosition.quantity, 
-      slippageTolerance: 0.01,
-      marketPrice: targetExitPrice // Sell at the Stop Price trigger
-    });
-
-    // Audit against the Stop Price to see the REAL slippage
-    this.auditor.auditExecution(this.activePosition.stopPrice, result);
+  private async closePosition(price: number, reason: string): Promise<void> {
+    if (!this.activePosition || this.isProcessingExit) return;
     
-    const finalPnl = (result.filledPrice - this.activePosition.entryPrice) * result.filledQuantity;
-    this.riskManager.updatePnL(finalPnl);
-    
-    console.log(`[ORCHESTRATOR] EXIT (${reason}) | Target: ${this.activePosition.stopPrice.toFixed(2)} | Filled: ${result.filledPrice.toFixed(4)} | PnL: $${finalPnl.toFixed(2)}`);
-    
-    this.activePosition = null;
-  }
+    this.isProcessingExit = true; // Lock
+    try {
+      const result = await this.executionLayer.executeSell({ 
+        tokenAddress: "MOCK_TOKEN", quantity: this.activePosition.quantity, 
+        slippageTolerance: 0.01, marketPrice: price 
+      });
 
-  private async recordTradeTelemetry(
-    token: string, 
-    stage: number, 
-    risk: number, 
-    result: any, 
-    current: any, 
-    regime: string
-  ) {
-    const telemetry: any = {
-      timestamp: new Date().toISOString(),
-      token,
-      stage,
-      expectedRisk: risk,
-      jupiterPriceImpact: result.slippage,
-      modeledSlippage: result.slippage, // In Dry Run, these are often linked
-      realSlippageEstimate: result.slippage, 
-      liquidity: current.liquidity,
-      poolImpact: (result.filledQuantity * result.filledPrice) / current.liquidity,
-      regimeState: regime,
-      executionMode: CONFIG.EXECUTION_MODE
-    };
-    
-    TradeLogger.recordTelemetry(telemetry);
-  }
-
-   private async logTelemetry(stage: number, risk: number, result: any, current: Candle, regime: string) {
-    TradeLogger.recordTelemetry({
-      timestamp: new Date().toISOString(),
-      token: "MOCK_TOKEN", // Update to real mint in Phase 4
-      stage: stage,
-      expectedRiskUsd: risk,
-      jupiterPriceImpact: result.slippage,
-      modeledSlippage: result.slippage, // Currently synced in Dry Run
-      realSlippageDelta: 0, // Calculated during post-mortem
-      liquidityUsd: current.liquidity,
-      poolImpactUsd: (result.filledQuantity * result.filledPrice) / current.liquidity,
-      regimeState: regime,
-      executionMode: CONFIG.EXECUTION_MODE
-    });
+      const finalPnl = (result.filledPrice - this.activePosition.entryPrice) * result.filledQuantity;
+      this.riskManager.updatePnL(finalPnl);
+      
+      console.log(`[ORCHESTRATOR] EXIT (${reason}) | Realized Price: ${result.filledPrice.toFixed(4)} | PnL: $${finalPnl.toFixed(2)}`);
+      this.activePosition = null;
+    } finally {
+      this.isProcessingExit = false; // Release
+    }
   }
 }

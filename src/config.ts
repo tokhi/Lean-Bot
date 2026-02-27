@@ -9,34 +9,51 @@ export type ExecutionMode = "DRY_RUN" | "LIVE";
 
 const EXECUTION_MODE: ExecutionMode = (process.env['EXECUTION_MODE'] as ExecutionMode) ?? "DRY_RUN";
 const WALLET_PRIVATE_KEY = process.env['WALLET_PRIVATE_KEY'] ?? "";
+const MICRO_LIVE_TEST = process.env['MICRO_LIVE_TEST'] === "true";
 
 /**
- * SAFETY GUARD: PILOT DISCIPLINE
+ * FATAL SAFETY GUARDS: PHASE 3.1a
+ * 
+ * Logic:
+ * 1. If mode is LIVE, a private key MUST exist.
+ * 2. If mode is LIVE, MICRO_LIVE_TEST MUST be true. 
+ *    This prevents "Unrestricted Live" mode which is not yet authorized.
  */
-if (EXECUTION_MODE === "LIVE" && !WALLET_PRIVATE_KEY) {
-  console.error("\n[FATAL ERROR] System configuration mismatch.");
-  console.error("EXECUTION_MODE is set to 'LIVE' but WALLET_PRIVATE_KEY is missing in .env.");
-  process.exit(1);
+if (EXECUTION_MODE === "LIVE") {
+  if (!WALLET_PRIVATE_KEY) {
+    console.error("\n[FATAL ERROR] EXECUTION_MODE is 'LIVE' but WALLET_PRIVATE_KEY is missing.");
+    process.exit(1);
+  }
+  
+  if (!MICRO_LIVE_TEST) {
+    console.error("\n[FATAL ERROR] LIVE mode requires MICRO_LIVE_TEST=true for safety.");
+    console.error("Unrestricted LIVE trading is currently disabled in the protocol logic.");
+    process.exit(1);
+  }
 }
 
 export const CONFIG = {
-  // 1. HARD GUARDRAILS (Immutable at Runtime)
+  // 1. GLOBAL STRATEGY GUARDRAILS
   MAX_PORTFOLIO_RISK_PCT: 0.015,  // 1.5% portfolio risk per trade
   DAILY_DRAWDOWN_LIMIT_PCT: 0.04,  // 4% total daily loss limit
-  MIN_LIQUIDITY_USD: 200000,      // Minimum pool depth to consider trading
-  MAX_POOL_IMPACT_PCT: 0.005,     // 0.5% maximum price impact allowed per trade
-  SLIPPAGE_TOLERANCE_BPS: 150,    // 1.5% (150 basis points) max allowed slippage
+  MIN_LIQUIDITY_USD: 200000,      // Minimum pool depth
+  MAX_POOL_IMPACT_PCT: 0.005,     // 0.5% maximum price impact
+  SLIPPAGE_TOLERANCE_BPS: 150,    // 1.5% max slippage
 
-  // 2. OPERATIONAL MODE
+  // 2. PHASE 3.1a MICRO LIVE CONSTRAINTS
+  // Purpose: Limit maximum financial exposure during plumbing validation.
+  MICRO_LIVE_TEST,
+  MAX_MICRO_RISK_USD: 5,          // Hard cap: Maximum $5 loss (1R)
+  MAX_MICRO_POSITION_USD: 25,     // Hard cap: Maximum $25 total exposure per trade
+
+  // 3. OPERATIONAL MODE
   EXECUTION_MODE,
 
-  // 3. NETWORK SETTINGS
+  // 4. NETWORK SETTINGS
   RPC_URL: process.env['RPC_URL'] ?? "https://api.mainnet-beta.solana.com",
   WSS_URL: process.env['WSS_URL'] ?? "wss://api.mainnet-beta.solana.com",
 
-  // 4. API KEYS
+  // 5. SECRETS & API KEYS
   JUPITER_API_KEY: process.env['JUPITER_API_KEY'] ?? "",
-
-  // 5. SECRETS
   WALLET_PRIVATE_KEY,
 };
