@@ -1,10 +1,5 @@
 import 'dotenv/config';
 
-/**
- * ExecutionMode defines the environment for the bot's muscles.
- * - DRY_RUN: Uses real market prices but MOCKS all trades.
- * - LIVE: Sends real transactions to the Solana network (WARNING: REAL FUNDS).
- */
 export type ExecutionMode = "DRY_RUN" | "LIVE";
 
 const EXECUTION_MODE: ExecutionMode = (process.env['EXECUTION_MODE'] as ExecutionMode) ?? "DRY_RUN";
@@ -12,48 +7,52 @@ const WALLET_PRIVATE_KEY = process.env['WALLET_PRIVATE_KEY'] ?? "";
 const MICRO_LIVE_TEST = process.env['MICRO_LIVE_TEST'] === "true";
 
 /**
- * FATAL SAFETY GUARDS: PHASE 3.1a
- * 
- * Logic:
- * 1. If mode is LIVE, a private key MUST exist.
- * 2. If mode is LIVE, MICRO_LIVE_TEST MUST be true. 
- *    This prevents "Unrestricted Live" mode which is not yet authorized.
+ * NEW CONFIGURATION FLAG: DRY_MULTI_TOKEN
+ * Logic: 
+ * - If true: Bot can scan and monitor multiple tokens in parallel.
+ * - This flag is ONLY effective when EXECUTION_MODE is "DRY_RUN".
+ */
+const DRY_MULTI_TOKEN = process.env['DRY_MULTI_TOKEN'] === "true";
+
+/**
+ * SAFETY GUARDS
  */
 if (EXECUTION_MODE === "LIVE") {
   if (!WALLET_PRIVATE_KEY) {
-    console.error("\n[FATAL ERROR] EXECUTION_MODE is 'LIVE' but WALLET_PRIVATE_KEY is missing.");
+    console.error("[FATAL] LIVE mode requires WALLET_PRIVATE_KEY.");
     process.exit(1);
   }
-  
   if (!MICRO_LIVE_TEST) {
-    console.error("\n[FATAL ERROR] LIVE mode requires MICRO_LIVE_TEST=true for safety.");
-    console.error("Unrestricted LIVE trading is currently disabled in the protocol logic.");
+    console.error("[FATAL] LIVE mode requires MICRO_LIVE_TEST=true.");
     process.exit(1);
   }
 }
 
 export const CONFIG = {
   // 1. GLOBAL STRATEGY GUARDRAILS
-  MAX_PORTFOLIO_RISK_PCT: 0.015,  // 1.5% portfolio risk per trade
-  DAILY_DRAWDOWN_LIMIT_PCT: 0.04,  // 4% total daily loss limit
-  MIN_LIQUIDITY_USD: 200000,      // Minimum pool depth
-  MAX_POOL_IMPACT_PCT: 0.005,     // 0.5% maximum price impact
-  SLIPPAGE_TOLERANCE_BPS: 150,    // 1.5% max slippage
+  MAX_PORTFOLIO_RISK_PCT: 0.015,
+  DAILY_DRAWDOWN_LIMIT_PCT: 0.04,
+  MIN_LIQUIDITY_USD: 200000,
+  MAX_POOL_IMPACT_PCT: 0.005,
+  SLIPPAGE_TOLERANCE_BPS: 150,
 
-  // 2. PHASE 3.1a MICRO LIVE CONSTRAINTS
-  // Purpose: Limit maximum financial exposure during plumbing validation.
-  MICRO_LIVE_TEST,
-  MAX_MICRO_RISK_USD: 5,          // Hard cap: Maximum $5 loss (1R)
-  MAX_MICRO_POSITION_USD: 25,     // Hard cap: Maximum $25 total exposure per trade
-
-  // 3. OPERATIONAL MODE
+  // 2. OPERATIONAL MODE
   EXECUTION_MODE,
+  MICRO_LIVE_TEST,
+  
+  /**
+   * MULTI-TOKEN LOGIC GATE
+   * Forced to 'false' if mode is LIVE to ensure single-token supervision.
+   */
+  DRY_MULTI_TOKEN: EXECUTION_MODE === "LIVE" ? false : DRY_MULTI_TOKEN,
 
-  // 4. NETWORK SETTINGS
+  // 3. PHASE 3.1a MICRO LIVE CONSTRAINTS
+  MAX_MICRO_RISK_USD: 5,
+  MAX_MICRO_POSITION_USD: 30,
+
+  // 4. NETWORK & API
   RPC_URL: process.env['RPC_URL'] ?? "https://api.mainnet-beta.solana.com",
   WSS_URL: process.env['WSS_URL'] ?? "wss://api.mainnet-beta.solana.com",
-
-  // 5. SECRETS & API KEYS
   JUPITER_API_KEY: process.env['JUPITER_API_KEY'] ?? "",
   WALLET_PRIVATE_KEY,
 };

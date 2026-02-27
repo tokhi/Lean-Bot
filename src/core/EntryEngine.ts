@@ -1,68 +1,95 @@
 import type { Candle } from "../types/MarketTypes.js";
 
+/**
+ * Result of the entry evaluation.
+ */
 export interface EntrySignal {
   readonly enter: boolean;
   readonly breakoutLevel: number;
-  readonly strengthScore: number;
-  readonly reason: string; // Added for "Near-Miss" visibility
+  readonly strengthScore: number; // 0 - 10 scale
+  readonly reason: string;        // Contextual reason for decision
 }
 
-/**
- * EntryEngine V2.2 (With Near-Miss Logic)
- * 
- * Determines if Stage 1 criteria are met and provides detailed feedback 
- * when a trade is filtered out.
- */
 export class EntryEngine {
-  private static readonly LOOKBACK_PERIOD = 5;
+  private static readonly LOOKBACK_PERIOD = 5; 
   private static readonly VOLUME_ACCEL_MULTIPLIER = 3.0;
 
+  /**
+   * Deterministically evaluates if current market state warrants a Stage 1 entry.
+   * 
+   * Logic Flow:
+   * 1. Windowing: Analyzes current candle vs average of previous 5.
+   * 2. Breakout: Close must exceed the highest 'High' of the lookback period.
+   * 3. Volume: Current volume must be 3x the lookback average.
+   * 4. Near-Miss: Logs specific reasons for rejection to calibrate thresholds.
+   */
   public static evaluate(
     recentCandles: Candle[],
     regime: string,
     minLiquidity: number
   ): EntrySignal {
+    // 1. Data Integrity Guard
     if (recentCandles.length <= this.LOOKBACK_PERIOD) {
-      return { enter: false, breakoutLevel: 0, strengthScore: 0, reason: "INITIALIZING_MEMORY" };
+      return { 
+        enter: false, 
+        breakoutLevel: 0, 
+        strengthScore: 0, 
+        reason: "INITIALIZING_MEMORY" 
+      };
     }
 
     const currentCandle = recentCandles[recentCandles.length - 1]!;
     const previousCandles = recentCandles.slice(-(this.LOOKBACK_PERIOD + 1), -1);
 
-    // 1. Calculations
+    // 2. Math - Calculate Thresholds
     const breakoutLevel = Math.max(...previousCandles.map((c) => c.high));
     const avgVolume = previousCandles.reduce((sum, c) => sum + c.volume, 0) / this.LOOKBACK_PERIOD;
-    const volRatio = currentCandle.volume / avgVolume;
+    const volRatio = currentCandle.volume / (avgVolume || 1);
 
-    // 2. Logic Gates
+    // 3. Logic Gates
     const isExpanding = regime === "EXPANSION";
     const isPriceBreakout = currentCandle.close > breakoutLevel;
-    const isVolumeAccelerating = currentCandle.volume > avgVolume * this.VOLUME_ACCEL_MULTIPLIER;
+    const isVolumeAccelerating = volRatio >= this.VOLUME_ACCEL_MULTIPLIER;
     const hasLiquidity = currentCandle.liquidity >= minLiquidity;
 
-    // 3. Near-Miss Attribution
+    // 4. Decision and Near-Miss Attribution
     let reason = "WAITING_FOR_SIGNAL";
-    if (!isExpanding) reason = `REGIME_MISMATCH: ${regime}`;
-    else if (!hasLiquidity) reason = `INSUFFICIENT_LIQUIDITY: $${currentCandle.liquidity.toFixed(0)}`;
+    let enter = false;
+
+    if (!isExpanding) {
+      reason = `REGIME_FILTER: Market is ${regime}`;
+    } 
+    else if (!hasLiquidity) {
+      reason = `LIQUIDITY_FILTER: $${(currentCandle.liquidity / 1000).toFixed(0)}k < $${(minLiquidity / 1000).toFixed(0)}k`;
+    } 
     else if (isPriceBreakout && !isVolumeAccelerating) {
-      reason = `NEAR_MISS: Price Breakout ($${currentCandle.close.toFixed(6)}) but Volume weak (${volRatio.toFixed(1)}x < 3x)`;
+      reason = `FILTERED: Breakout confirmed but Volume Multiplier too low (${volRatio.toFixed(2)}x / 3.0x required)`;
     } 
     else if (!isPriceBreakout && isVolumeAccelerating) {
-      reason = `NEAR_MISS: Volume Spike (${volRatio.toFixed(1)}x) but no Price Breakout`;
+      reason = `FILTERED: Volume surging (${volRatio.toFixed(2)}x) but price below local high ($${breakoutLevel.toFixed(6)})`;
+    } 
+    else if (isPriceBreakout && isVolumeAccelerating) {
+      reason = "SIGNAL_CONFIRMED";
+      enter = true;
     }
 
-    const enter = isExpanding && isPriceBreakout && isVolumeAccelerating && hasLiquidity;
-
-    // 4. Score
+    // 5. Strength Scoring (Heuristic for logging)
     let strengthScore = 0;
     if (enter) {
+      // 50% from Volume intensity
       const volPoints = Math.min(5, (volRatio / this.VOLUME_ACCEL_MULTIPLIER) * 2);
+      // 50% from Breakout extension
       const priceExtension = (currentCandle.close - breakoutLevel) / breakoutLevel;
-      const pricePoints = Math.min(5, priceExtension * 100);
+      const pricePoints = Math.min(5, priceExtension * 100); 
+      
       strengthScore = Math.round(volPoints + pricePoints);
-      reason = "SIGNAL_CONFIRMED";
     }
 
-    return { enter, breakoutLevel, strengthScore, reason };
+    return {
+      enter,
+      breakoutLevel,
+      strengthScore: Math.min(10, strengthScore),
+      reason
+    };
   }
 }

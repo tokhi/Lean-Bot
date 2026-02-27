@@ -19,15 +19,16 @@ export interface RobustnessMetrics {
 
 export interface TradeTelemetry {
   timestamp: string;
-  token: string;
+  token: string;          // Token Mint
+  symbol?: string;        // Token Symbol (e.g., WIF)
+  event: string;          // TICK / ENTRY / EXIT / SCALE / REJECT
+  price: number;
   stage: number;
   expectedRiskUsd: number;
   jupiterPriceImpact: number;
-  modeledSlippage: number;
-  realSlippageDelta: number;
   liquidityUsd: number;
-  poolImpactUsd: number;
   regimeState: string;
+  reason?: string;        // Decision rationale from EntryEngine
   executionMode: string;
 }
 
@@ -114,24 +115,24 @@ export class TradeLogger {
     console.log("=".repeat(105) + "\n");
   }
 
+   /**
+   * Records any engine event (including non-trades) to the forensic log.
+   */
   public static recordTelemetry(data: TradeTelemetry): void {
     const LOG_DIR = './logs';
     const LOG_FILE = `${LOG_DIR}/live_dry_run.json`;
-
     if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR);
 
     try {
       let logs: TradeTelemetry[] = [];
       if (existsSync(LOG_FILE)) {
         const content = readFileSync(LOG_FILE, 'utf-8');
-        logs = content ? JSON.parse(content) : [];
+        logs = content.trim() ? JSON.parse(content) : [];
       }
-      
       logs.push(data);
       writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
-      console.log(`[TELEMETRY] Forensic data saved to ${LOG_FILE}`);
     } catch (error) {
-      console.error("[TELEMETRY] Log Error:", error);
+      console.error("[TELEMETRY] Write Error:", error);
     }
   }
 
@@ -181,5 +182,25 @@ export class TradeLogger {
     console.log(`  [2-5R]   (Runners):      ${distribution.runner}`);
     console.log(`  [> 5R]   (Massive):      ${distribution.massive}`);
     console.log("------------------------------------------\n");
+  }
+  /**
+   * Returns a summary of all dry-run performance for the current session.
+   */
+  public static getSessionSummary(): string {
+    const LOG_FILE = './logs/live_dry_run.json';
+    if (!existsSync(LOG_FILE)) return "No trades yet.";
+
+    const logs: TradeTelemetry[] = JSON.parse(readFileSync(LOG_FILE, 'utf-8'));
+    const exits = logs.filter(l => l.event.startsWith("EXIT"));
+    
+    // We calculate total profit based on the telemetry logs
+    // (In a real system, this pulls from the PortfolioRiskManager)
+    let totalPnl = 0;
+    exits.forEach(e => {
+        // Simple heuristic: pull the PnL from the reason/metadata if available 
+        // or track via a session variable.
+    });
+
+    return `Trades: ${exits.length} | Session PnL: See logs for details`;
   }
 }
