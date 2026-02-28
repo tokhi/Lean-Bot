@@ -1,53 +1,88 @@
 import { CONFIG } from "../config.js";
 
 export interface ScannedToken {
-  mint: string;
-  symbol: string;
-  liquidity: number;
-  volumeChange24h: number;
-  priceChange1h: number;
+  readonly mint: string;
+  readonly symbol: string;
+  readonly liquidity: number;
+  readonly rankingScore: number;
+  readonly type: "IGNITION" | "MODERATE";
 }
 
-/**
- * MarketScanner V2.4 (Velocity Focused)
- * 
- * Goal: Find the top N tokens on Solana that are actually moving, 
- * not just tokens that paid for a "Boost" ad.
- */
 export class MarketScanner {
-  // Use the search API to find active Solana pairs
-  private static readonly SEARCH_API = "https://api.dexscreener.com/latest/dex/search?q=solana";
+  private static readonly GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1";
+  
+  private static readonly BLACKLIST = [
+    "So11111111111111111111111111111111111111112", // SOL
+    "EPjFW36vnm7HqeogAq6Qg3LXYrDhwd6cfjSbwFrEBdis", // USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"  // USDT
+  ];
 
-  public static async getTrendingTokens(limit: number = 5): Promise<ScannedToken[]> {
+  public static async discoverHotTokens(limit: number = 3, excludeMints: string[] = []): Promise<ScannedToken[]> {
     try {
-      const response = await fetch(this.SEARCH_API);
+      const response = await fetch(this.GECKO_URL, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'TrendingBot/1.0' }
+      });
       if (!response.ok) return [];
 
-      const data: any = await response.json();
-      const pairs = data.pairs || [];
+      const data = await response.json() as any;
+      const pools = data.data || [];
+      const results: ScannedToken[] = [];
 
-      // 1. FILTER & RANK Logic
-      const candidates = pairs
-        .filter((p: any) => 
-          p.chainId === 'solana' && 
-          p.quoteToken.symbol === 'SOL' && 
-          (p.liquidity?.usd || 0) >= CONFIG.MIN_LIQUIDITY_USD &&
-          (p.volume?.m5 || 0) > 10000 // Increased volume floor for higher quality
-        )
-        // Sort by Volume Growth (m5) instead of total volume to find "Breakouts"
-        .sort((a: any, b: any) => (b.volume?.m5 || 0) - (a.volume?.m5 || 0)) 
-        .slice(0, limit);
+      for (const pool of pools) {
+        const attr = pool.attributes;
+        const mint = pool.relationships?.base_token?.data?.id?.split('_')[1];
+        const liq = parseFloat(attr.reserve_in_usd || "0");
+        const price = parseFloat(attr.base_token_price_usd || "0");
 
-      return candidates.map((p: any) => ({
-        mint: p.baseToken.address,
-        symbol: p.baseToken.symbol,
-        liquidity: p.liquidity.usd,
-        volumeChange24h: p.priceChange.m5 || 0,
-        priceChange1h: p.priceChange.h1 || 0
-      }));
-    } catch (error) {
-      console.error("[SCANNER] Failed to build Watchlist:", error);
-      return [];
-    }
+        if (!mint || this.BLACKLIST.includes(mint) || excludeMints.includes(mint)) continue;
+        
+        // 1. Stability Filter (Exclude SOL/USD pegs)
+        if ((price > 0.90 && price < 1.10) || (price > 120 && price < 180)) continue;
+
+        // 2. Dual-Engine Classification
+        // Ignition: 40k - 200k | Moderate: 200k - 5M
+        let type: "IGNITION" | "MODERATE";
+        if (liq >= 40000 && liq <= 200000) {
+            type = "IGNITION";
+        } else if (liq > 200000 && liq <= 5000000) {
+            type = "MODERATE";
+        } else {
+            continue; // Outside corridor
+        }
+
+        results.push({
+          mint: mint,
+          symbol: attr.name.split(' / ')[0] || "Unknown",
+          liquidity: liq,
+          type,
+          rankingScore: this.calculateHeatScore(attr)
+        });
+      }
+
+      // Sort by mathematical heat (Price move + Volume Intensity)
+      return results.sort((a, b) => b.rankingScore - a.rankingScore).slice(0, limit);
+    } catch (e) { return []; }
+  }
+
+  private static calculateHeatScore(attr: any): number {
+    const p5 = Math.abs(parseFloat(attr.price_change_percentage?.m5 || "0"));
+    const v5 = parseFloat(attr.volume_usd?.m5 || "0");
+    const liq = parseFloat(attr.reserve_in_usd || "1");
+    
+    // Intensity: How much volume is attacking the pool depth
+    const intensity = Math.min(v5 / liq, 5) * 100;
+    return (p5 * 0.5) + (intensity * 0.5);
+  }
+
+  public static async validateTokenHealth(mint: string): Promise<boolean> {
+    try {
+      const url = `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mint}/pools?page=1`;
+      const res = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } });
+      const json: any = await res.json();
+      const pool = json.data?.[0]?.attributes;
+      if (!pool) return false;
+      const liq = parseFloat(pool.reserve_in_usd || "0");
+      return liq >= 40000 && liq <= 5000000;
+    } catch { return false; }
   }
 }

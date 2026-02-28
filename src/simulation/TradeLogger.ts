@@ -1,206 +1,29 @@
-import type { TradeResult } from "../types/TradeTypes.js";
-import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
-
-/**
- * RobustnessMetrics provides a deep-dive into the strategy performance
- * across different market regimes.
- */
-export interface RobustnessMetrics {
-  readonly datasetName: string;
-  readonly winRate: number;
-  readonly profitFactor: number;
-  readonly totalNetR: number;
-  readonly avgWinnerR: number;
-  readonly avgLoserR: number;
-  readonly maxDrawdownPercent: number;
-  readonly stage2ProgressionRate: number;
-  readonly stage3ProgressionRate: number;
-}
-
-export interface TradeTelemetry {
-  timestamp: string;
-  token: string;          // Token Mint
-  symbol?: string;        // Token Symbol (e.g., WIF)
-  event: string;          // TICK / ENTRY / EXIT / SCALE / REJECT
-  price: number;
-  stage: number;
-  expectedRiskUsd: number;
-  jupiterPriceImpact: number;
-  liquidityUsd: number;
-  regimeState: string;
-  reason?: string;        // Decision rationale from EntryEngine
-  executionMode: string;
-}
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 
 export class TradeLogger {
-  private logs: Map<string, any[]> = new Map();
+  private static readonly LOG_DIR = './logs';
+  private static readonly LOG_FILE = "trading_engine.log";
 
-  public logTrade(datasetName: string, result: any): void {
-    const datasetLogs = this.logs.get(datasetName) || [];
-    // Ensure realizedSlippage is never NaN
-    const sanitizedResult = {
-      ...result,
-      realizedSlippage: result.realizedSlippage || 0.005, // Default to 50bps if missing
-      stageReached: result.stageReached || 1
-    };
-    datasetLogs.push(sanitizedResult);
-    this.logs.set(datasetName, datasetLogs);
+  public static log(message: string, type: 'INFO' | 'WARN' | 'ERROR' | 'TRADE' = 'INFO'): void {
+    if (!existsSync(this.LOG_DIR)) mkdirSync(this.LOG_DIR);
+    const timestamp = new Date().toISOString();
+    const formatted = `[${timestamp}] [${type}] ${message}`;
+    console.log(formatted);
+    appendFileSync(`${this.LOG_DIR}/${this.LOG_FILE}`, formatted + '\n');
   }
 
-  public getRobustnessReport(datasetName: string, startingBalance: number): RobustnessMetrics {
-    const trades = this.logs.get(datasetName) || [];
-    if (trades.length === 0) {
-      return { datasetName, winRate: 0, profitFactor: 0, totalNetR: 0, avgWinnerR: 0, avgLoserR: 0, maxDrawdownPercent: 0, stage2ProgressionRate: 0, stage3ProgressionRate: 0 };
-    }
-
-    const wins = trades.filter(t => t.Rmultiple > 0);
-    const losses = trades.filter(t => t.Rmultiple <= 0);
-
-    const grossProfitR = wins.reduce((sum, t) => sum + t.Rmultiple, 0);
-    const grossLossR = Math.abs(losses.reduce((sum, t) => sum + t.Rmultiple, 0));
-
-    // Calculate Max Drawdown (Portfolio Level)
-    let peak = startingBalance;
-    let currentBal = startingBalance;
-    let maxDD = 0;
-
-    trades.forEach(t => {
-      // Assuming 1R = 1.5% of $1000 = $15 for simulation tracking
-      const pnlUsd = t.Rmultiple * 15;
-      currentBal += pnlUsd;
-      if (currentBal > peak) peak = currentBal;
-      const dd = (peak - currentBal) / peak;
-      if (dd > maxDD) maxDD = dd;
-    });
-
-    return {
-      datasetName,
-      winRate: (wins.length / trades.length) * 100,
-      profitFactor: grossLossR === 0 ? grossProfitR : grossProfitR / grossLossR,
-      totalNetR: trades.reduce((sum, t) => sum + t.Rmultiple, 0),
-      avgWinnerR: wins.length > 0 ? grossProfitR / wins.length : 0,
-      avgLoserR: losses.length > 0 ? grossLossR / losses.length : 0,
-      maxDrawdownPercent: maxDD * 100,
-      stage2ProgressionRate: (trades.filter(t => t.stageReached >= 2).length / trades.length) * 100,
-      stage3ProgressionRate: (trades.filter(t => t.stageReached >= 3).length / trades.length) * 100
-    };
-  }
-
-  public printComparisonTable(reports: RobustnessMetrics[]): void {
-    console.log("\n" + "=".repeat(105));
-    console.log(
-      "DATASET".padEnd(20) + 
-      "WIN%".padEnd(10) + 
-      "PF".padEnd(10) + 
-      "NET R".padEnd(12) + 
-      "AVG WIN R".padEnd(12) + 
-      "MAX DD%".padEnd(12) + 
-      "S2 RATE%".padEnd(10) + 
-      "S3 RATE%"
-    );
-    console.log("-".repeat(105));
-
-    reports.forEach(r => {
-      console.log(
-        r.datasetName.padEnd(20) + 
-        r.winRate.toFixed(1).padEnd(10) + 
-        r.profitFactor.toFixed(2).padEnd(10) + 
-        r.totalNetR.toFixed(2).padEnd(12) + 
-        r.avgWinnerR.toFixed(2).padEnd(12) + 
-        r.maxDrawdownPercent.toFixed(2).padEnd(12) + 
-        r.stage2ProgressionRate.toFixed(1).padEnd(10) + 
-        r.stage3ProgressionRate.toFixed(1)
-      );
-    });
-    console.log("=".repeat(105) + "\n");
-  }
-
-   /**
-   * Records any engine event (including non-trades) to the forensic log.
-   */
-  public static recordTelemetry(data: TradeTelemetry): void {
-    const LOG_DIR = './logs';
-    const LOG_FILE = `${LOG_DIR}/live_dry_run.json`;
-    if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR);
-
-    try {
-      let logs: TradeTelemetry[] = [];
-      if (existsSync(LOG_FILE)) {
-        const content = readFileSync(LOG_FILE, 'utf-8');
-        logs = content.trim() ? JSON.parse(content) : [];
-      }
-      logs.push(data);
-      writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
-    } catch (error) {
-      console.error("[TELEMETRY] Write Error:", error);
-    }
-  }
-
-  /**
-   * Prints advanced metrics for the Mixed Regime validation.
-   */
-  public printDetailedMetrics(datasetName: string, startingBalance: number): void {
-    const trades = this.logs.get(datasetName) || [];
-    if (trades.length === 0) return;
-
-    let peakEquity = startingBalance;
-    let currentEquity = startingBalance;
-    let totalSlippage = 0;
-    let maxConsecutiveLosses = 0;
-    let currentLossStreak = 0;
+  public static logTrade(data: {
+    symbol: string,
+    entryPrice: number,
+    exitPrice: number,
+    Rmultiple: number,
+    reason: string,
+    pnlUsd: number
+  }) {
+    this.log(`[TRADE_CLOSED] ${data.symbol} | Result: ${data.Rmultiple.toFixed(2)}R | PnL: $${data.pnlUsd.toFixed(2)} | Reason: ${data.reason}`, 'TRADE');
+    this.log(` > In: $${data.entryPrice.toFixed(6)} | Out: $${data.exitPrice.toFixed(6)}`, 'TRADE');
     
-    const distribution = { stopOut: 0, smallWin: 0, runner: 0, massive: 0 };
-
-    trades.forEach(t => {
-      // 1. R Distribution
-      if (t.Rmultiple <= 0) distribution.stopOut++;
-      else if (t.Rmultiple < 2) distribution.smallWin++;
-      else if (t.Rmultiple < 5) distribution.runner++;
-      else distribution.massive++;
-
-      // 2. Slippage & Equity
-      totalSlippage += t.realizedSlippage;
-      currentEquity += (t.Rmultiple * 15); // Using $15 as R unit
-      if (currentEquity > peakEquity) peakEquity = currentEquity;
-
-      // 3. Loss Streak
-      if (t.Rmultiple <= 0) {
-        currentLossStreak++;
-        if (currentLossStreak > maxConsecutiveLosses) maxConsecutiveLosses = currentLossStreak;
-      } else {
-        currentLossStreak = 0;
-      }
-    });
-
-    console.log(`--- DETAILED METRICS: ${datasetName} ---`);
-    console.log(`Peak Portfolio Equity:     $${peakEquity.toFixed(2)}`);
-    console.log(`Total Slippage Accrued:    ${(totalSlippage * 100).toFixed(4)}%`);
-    console.log(`Max Consecutive Losses:    ${maxConsecutiveLosses}`);
-    console.log(`R Distribution:`);
-    console.log(`  [<= 0R]  (Stops):        ${distribution.stopOut}`);
-    console.log(`  [0-2R]   (Small):        ${distribution.smallWin}`);
-    console.log(`  [2-5R]   (Runners):      ${distribution.runner}`);
-    console.log(`  [> 5R]   (Massive):      ${distribution.massive}`);
-    console.log("------------------------------------------\n");
-  }
-  /**
-   * Returns a summary of all dry-run performance for the current session.
-   */
-  public static getSessionSummary(): string {
-    const LOG_FILE = './logs/live_dry_run.json';
-    if (!existsSync(LOG_FILE)) return "No trades yet.";
-
-    const logs: TradeTelemetry[] = JSON.parse(readFileSync(LOG_FILE, 'utf-8'));
-    const exits = logs.filter(l => l.event.startsWith("EXIT"));
-    
-    // We calculate total profit based on the telemetry logs
-    // (In a real system, this pulls from the PortfolioRiskManager)
-    let totalPnl = 0;
-    exits.forEach(e => {
-        // Simple heuristic: pull the PnL from the reason/metadata if available 
-        // or track via a session variable.
-    });
-
-    return `Trades: ${exits.length} | Session PnL: See logs for details`;
+    const path = `./logs/telemetry.json`;
+    appendFileSync(path, JSON.stringify({ timestamp: new Date().toISOString(), ...data }) + '\n');
   }
 }

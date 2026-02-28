@@ -3,92 +3,66 @@ import type { MarketProvider, Candle } from "../types/MarketTypes.js";
 export class LiveMarketProvider implements MarketProvider {
   private candleBuffer: Map<string, Candle[]> = new Map();
   private tickBuffer: Map<string, { price: number; vol: number; liq: number }[]> = new Map();
-  
-  private readonly DEX_API_URL = "https://api.dexscreener.com/latest/dex/tokens/";
+  private symbolMap: Map<string, string> = new Map();
+  private readonly GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1";
 
-public async getCurrentPrice(tokenAddress: string): Promise<number> {
+  public setSymbol(mint: string, symbol: string) { this.symbolMap.set(mint, symbol); }
+  public getSymbol(mint: string): string { return this.symbolMap.get(mint) || mint.slice(0, 4); }
+
+  public async pollPrices(mints: string[]): Promise<void> {
     try {
-      // DEBUG: Prove the bot is trying to talk to the internet
-      // console.log(`[NETWORK] Polling DexScreener for ${tokenAddress.slice(0,4)}...`);
+      const res = await fetch(this.GECKO_TRENDING, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } });
+      const json = await res.json() as any;
+      const pools = json.data || [];
 
-      const response = await fetch(`${this.DEX_API_URL}${tokenAddress}`, {
-        signal: AbortSignal.timeout(5000) // 5s timeout to prevent hanging
-      });
-      
-      if (!response.ok) return 0;
-
-      const json: any = await response.json();
-      const pair = json.pairs?.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
-
-      if (!pair) return 0;
-
-      const price = parseFloat(pair.priceUsd);
-      const liquidity = pair.liquidity?.usd || 0;
-      const volume = pair.volume?.m5 || 0; 
-
-      const ticks = this.tickBuffer.get(tokenAddress) || [];
-      ticks.push({ price, vol: volume, liq: liquidity });
-      this.tickBuffer.set(tokenAddress, ticks);
-
-      return price;
-    } catch (error) {
-      console.error(`[NETWORK ERROR] Check your internet/DNS:`, error);
-      return 0;
-    }
+      for (const mint of mints) {
+        const pool = pools.find((p: any) => p.relationships?.base_token?.data?.id === `solana_${mint}`);
+        if (pool) {
+          const attr = pool.attributes;
+          const ticks = this.tickBuffer.get(mint) || [];
+          ticks.push({ 
+            price: parseFloat(attr.base_token_price_usd), 
+            vol: parseFloat(attr.volume_usd.h1), 
+            liq: parseFloat(attr.reserve_in_usd) 
+          });
+          this.tickBuffer.set(mint, ticks);
+        }
+      }
+    } catch (e) {}
   }
-  public getPoolLiquidity(tokenAddress: string): number {
-    const ticks = this.tickBuffer.get(tokenAddress) || [];
-    return ticks.length > 0 ? ticks[ticks.length - 1]!.liq : 0;
+
+  public subscribePriceUpdates(mints: string[], cb: (address: string, price: number) => void): void {
+    setInterval(async () => {
+      await this.pollPrices(mints);
+      for (const mint of mints) {
+        const last = this.tickBuffer.get(mint)?.slice(-1)[0];
+        if (last) cb(mint, last.price);
+      }
+    }, 5000);
+  }
+
+  public getPoolLiquidity(mint: string): number {
+    return this.tickBuffer.get(mint)?.slice(-1)[0]?.liq || 0;
   }
 
   public rollCandle(tokenAddress: string): void {
     const ticks = this.tickBuffer.get(tokenAddress) || [];
-    if (ticks.length === 0) {
-        console.warn(`[CANDLE] Cannot roll ${tokenAddress.slice(0,4)}: No ticks received in last 60s.`);
-        return;
-    }
-
-    const prices = ticks.map(t => t.price);
-    const newCandle: Candle = {
+    if (ticks.length === 0) return;
+    const p = ticks.map(t => t.price);
+    const candle: Candle = {
       timestamp: Date.now(),
-      open: prices[0]!,
-      high: Math.max(...prices),
-      low: Math.min(...prices),
-      close: prices[prices.length - 1]!,
-      volume: ticks[ticks.length - 1]!.vol, 
-      liquidity: ticks[ticks.length - 1]!.liq
+      open: p[0]!, high: Math.max(...p), low: Math.min(...p), close: p[p.length-1]!,
+      volume: ticks[ticks.length-1]!.vol / 60,
+      liquidity: ticks[ticks.length-1]!.liq,
+      upperWickPct: 0
     };
-
     const history = this.candleBuffer.get(tokenAddress) || [];
-    history.push(newCandle);
-    if (history.length > 20) history.shift();
-    this.candleBuffer.set(tokenAddress, history);
-    this.tickBuffer.set(tokenAddress, []); // Reset
-    
-    console.log(`[CANDLE] ${tokenAddress.slice(0,4)} rolled. History: ${history.length}/7`);
+    history.push(candle);
+    this.candleBuffer.set(tokenAddress, history.slice(-20));
+    this.tickBuffer.set(tokenAddress, []);
   }
 
- public subscribePriceUpdates(tokenAddresses: string[], callback: (address: string, price: number) => void): void {
-    // Clear existing intervals if you add logic for that, but for now:
-    setInterval(async () => {
-      // Logic: Poll ALL tokens in parallel so one slow API call doesn't block the rest
-      await Promise.all(tokenAddresses.map(async (address) => {
-        try {
-          const price = await this.getCurrentPrice(address);
-          if (price > 0) {
-            callback(address, price);
-          }
-        } catch (err) {
-          // Per-token error handling to prevent loop crash
-          console.error(`[POLL ERROR] ${address.slice(0,4)}:`, err);
-        }
-      }));
-    }, 4000); // 4s interval
-  }
-
-  public getRecentCandles(tokenAddress: string, count: number): Candle[] {
-    return (this.candleBuffer.get(tokenAddress) || []).slice(-count);
-  }
-
-  public getGlobalBreadth(): number { return 5; }
+  public getRecentCandles(mint: string, count: number): Candle[] { return (this.candleBuffer.get(mint) || []).slice(-count); }
+  public getVolumeDelta(tokenAddress: string) { return { buy2m: 100, sell2m: 100 }; }
+  public getGlobalBreadth() { return 5; }
 }

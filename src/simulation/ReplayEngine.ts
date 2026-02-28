@@ -1,98 +1,95 @@
-// 1. Type Imports (verbatimModuleSyntax)
+// 1. Strict Type Imports (verbatimModuleSyntax)
 import type { Candle } from "../types/MarketTypes.js";
 import type { Position, TradeResult } from "../types/TradeTypes.js";
 import type { Regime } from "../core/RegimeEngine.js";
 
-// 2. Core Logic Imports
+// 2. Logic Imports
 import { EntryEngine } from "../core/EntryEngine.js";
 import { PositionSizer } from "../core/PositionSizer.js";
-import { ExitEngine } from "../core/ExitEngine.js";
+import { ExitEngine, type ExitDecision } from "../core/ExitEngine.js";
 import { ScalingEngine } from "../core/ScalingEngine.js";
 import { RegimeEngine } from "../core/RegimeEngine.js";
 import { PortfolioRiskManager } from "../risk/PortfolioRiskManager.js";
+import { TradeLogger } from "./TradeLogger.js";
 
 /**
- * ReplayEngine V2.1 (Production-Ready Simulation)
- * Orchestrates deterministic simulation with Portfolio Heat and Atomic Partitioning simulation.
+ * ReplayEngine V4.2
+ * 
+ * Logic:
+ * 1. Simulates the Dual-Engine strategy (Ignition vs Moderate) based on liquidity.
+ * 2. Implements Volatility-Adaptive sizing (6th/7th args in PositionSizer).
+ * 3. Tracks simulation expectancy and R-multiples for validation.
  */
 export class ReplayEngine {
-  private portfolio: number;
-  private readonly riskPercent: number;
+  private portfolioSol: number;
   private readonly riskManager: PortfolioRiskManager;
   
+  public history: TradeResult[] = [];
   private activePosition: Position | null = null;
-  public history: TradeResult[] = []; // Public for Logger access in Main
+  private solPrice: number = 140; // Simulated SOL price for USD math
   private dailyLosses: number = 0;
 
-  constructor(initialBalance: number, riskPercent: number = 0.015) {
-    this.portfolio = initialBalance;
-    this.riskPercent = riskPercent;
-    this.riskManager = new PortfolioRiskManager(initialBalance);
+  constructor(initialSol: number) {
+    this.portfolioSol = initialSol;
+    // Risk Manager tracks internal dollar PnL for drawdown logic
+    this.riskManager = new PortfolioRiskManager(initialSol * 140);
   }
 
   /**
    * Main Simulation Loop
    */
   public run(candles: Candle[], simBreadth: number = 5): void {
-    const LOOKBACK = 6;
+    const LOOKBACK = 10;
 
     for (let i = LOOKBACK; i < candles.length; i++) {
       const current = candles[i];
       if (!current) continue; 
 
       const slice = candles.slice(i - LOOKBACK, i + 1);
+      const lastClosedCandle = candles[i - 1]!;
+      const liq5mAgo = candles[i - 5]?.liquidity || current.liquidity;
       
-      // Calculate Market Regime
+      // Determine Market Regime
       const regime: Regime = RegimeEngine.calculate(simBreadth, this.dailyLosses, 0.04);
 
-      // If the bot has been idle for more than 60 minutes (60 candles), reset the circuit breaker
+      // Handle Cooldown Reset (Simulation Logic)
       if (!this.activePosition && regime === "HIBERNATE" && this.dailyLosses >= 3) {
-          const lastExit = this.history.length > 0 ? this.history[this.history.length - 1]!.duration : 0; // Use as proxy for idle time
-          // For simulation simplicity, we will reset losses every 40 candles 
-          // to allow the bot to test the next regime block.
           if (i % 40 === 0) {
-              console.log(`[SYSTEM] Cooldown Expired. Resetting Circuit Breaker.`);
+              TradeLogger.log(`[SYSTEM] Cooldown Expired. Resetting Circuit Breaker.`, 'INFO');
               this.dailyLosses = 0;
           }
       }
 
-      // --- HANDLE OPEN POSITION ---
+      // --- 1. EVALUATE OPEN POSITION ---
       if (this.activePosition) {
-        // 1. Check Technical Stop Loss
-        if (current.low <= this.activePosition.stopPrice) {
-          this.closePosition(this.activePosition.stopPrice, current.timestamp);
-          continue; 
-        }
-
-        // 2. Trailing Stop Update (ATR / Parabolic / Velocity)
-        const updatedPeak = Math.max(this.activePosition.peakPrice, current.high);
-        const newStop = ExitEngine.calculateUpdatedStop(
-          { ...this.activePosition, peakPrice: updatedPeak },
+        // Mock Volume Delta for simulation (assume neutral pressure)
+        const mockVolDelta = { buy2m: 100, sell2m: 100 };
+        
+        const decision: ExitDecision = ExitEngine.evaluate(
+          this.activePosition,
           current.close,
-          current.close * 0.05, 
-          0.04,                 
-          current.liquidity,
-          current.timestamp
+          lastClosedCandle,
+          { current: current.liquidity, entry: this.activePosition.initialLiquidity },
+          mockVolDelta,
+          Math.floor((current.timestamp - this.activePosition.openTime) / 60000),
+          this.activePosition.breakoutLevel
         );
 
-        if (newStop > this.activePosition.stopPrice) {
-          this.activePosition = { 
-            ...this.activePosition, 
-            peakPrice: updatedPeak, 
-            stopPrice: newStop 
-          };
+        if (decision.action === 'EXIT') {
+          this.closePosition(current.close, current.timestamp, decision.reason);
+          continue;
         }
 
-        // 3. Scaling Engine (Asymmetric Pyramiding)
-        const scaling = ScalingEngine.evaluate(
-          this.activePosition, 
-          current.close, 
-          this.portfolio, 
-          current.liquidity
-        );
+        // Apply Trailing Stop Ratchet
+        if (decision.updatedStop && decision.updatedStop > this.activePosition.stopPrice) {
+          this.activePosition = { ...this.activePosition, stopPrice: decision.updatedStop };
+        }
 
+        // Apply Scaling Logic
+        const currentBalUsd = this.portfolioSol * this.solPrice;
+        const scaling = ScalingEngine.evaluate(this.activePosition, current.close, currentBalUsd, current.liquidity);
+        
         if (scaling.addQuantity > 0) {
-          console.log(`[SCALING] Stage ${this.activePosition.stage} -> ${scaling.newStage} | Adding: ${scaling.addQuantity.toFixed(2)} units`);
           this.activePosition = {
             ...this.activePosition,
             quantity: this.activePosition.quantity + scaling.addQuantity,
@@ -101,32 +98,44 @@ export class ReplayEngine {
         }
       } 
       
-      // --- HANDLE NEW ENTRIES ---
-      // Check Portfolio Heat: Current Trades = 0, Active Risk = 0 (for this 1-token sim)
-      const canEnter = !this.activePosition && this.riskManager.canTrade(0, 0);
-
-      if (canEnter) {
-        const signal = EntryEngine.evaluate(slice, regime, 150000);
+      // --- 2. EVALUATE NEW ENTRY ---
+      if (!this.activePosition && this.riskManager.canTrade(0, 0)) {
+        // EntryEngine V4.0 Signature: (history, tokenAgeHours, liquidity5mAgo)
+        const signal = EntryEngine.evaluate(slice, 24, liq5mAgo);
         
         if (signal.enter) {
-          const sizing = PositionSizer.calculateStage1Size(
-            this.portfolio,
-            this.portfolio * this.riskPercent, 
-            current.close,
-            current.close * 0.90,
-            current.liquidity
+          // Calculate 5m velocity for Adaptive Sizing
+          const p5mEarlier = candles[i - 5]?.close || current.open;
+          const pChange5m = ((current.close - p5mEarlier) / p5mEarlier) * 100;
+
+          // Classification logic (Step 1.2 and Rule 7)
+          // Ignition if liq < 200k, Moderate otherwise.
+          const baseRiskSol = current.liquidity <= 200000 ? 0.15 : 0.20;
+
+          // PositionSizer V4.2 Signature: 7 Arguments
+          const sizing = PositionSizer.calculatePosition(
+            this.solPrice, 
+            current.close, 
+            current.close * 0.90, // Initial 10% Stop
+            current.liquidity, 
+            this.portfolioSol,
+            pChange5m,
+            baseRiskSol // The 7th Argument
           );
 
-          if (!sizing.rejected && sizing.quantity > 0) {
-            console.log(`[ENTRY] Stage 1 | Price: ${current.close} | Qty: ${sizing.quantity.toFixed(2)} | Exp. Risk: $${sizing.effectiveRisk.toFixed(2)}`);
+          if (!sizing.isRejected && sizing.quantity > 0) {
             this.activePosition = {
+              symbol: "SIM",
               entryPrice: current.close,
               quantity: sizing.quantity,
               stopPrice: current.close * 0.90,
               stage: 1,
-              riskAmount: sizing.effectiveRisk,
+              riskAmount: sizing.riskUsd,
               peakPrice: current.close,
-              openTime: current.timestamp
+              openTime: current.timestamp,
+              lastPrice: current.close,
+              breakoutLevel: current.close,
+              initialLiquidity: current.liquidity
             };
           }
         }
@@ -135,38 +144,49 @@ export class ReplayEngine {
   }
 
   /**
-   * Finalizes trade with Atomic Partitioning Tax simulation
+   * Finalizes position and calculates R-multiples
    */
- private closePosition(exitPrice: number, exitTime: number): void {
+  private closePosition(price: number, time: number, reason: string): void {
     if (!this.activePosition) return;
-
-    const pnl = (exitPrice - this.activePosition.entryPrice) * this.activePosition.quantity;
-    const rMultiple = pnl / this.activePosition.riskAmount;
+    const pnlUsd = (price - this.activePosition.entryPrice) * this.activePosition.quantity;
+    const r = pnlUsd / this.activePosition.riskAmount;
 
     this.history.push({
       entryPrice: this.activePosition.entryPrice,
-      exitPrice: exitPrice,
-      Rmultiple: rMultiple,
-      duration: exitTime - this.activePosition.openTime,
-      maxFavorableExcursion: this.activePosition.peakPrice / this.activePosition.entryPrice,
+      exitPrice: price,
+      Rmultiple: r,
+      duration: time - this.activePosition.openTime,
+      maxFavorableExcursion: 0, 
       maxAdverseExcursion: 0,
-      stageReached: this.activePosition.stage // Capture the final stage before closing
+      stageReached: this.activePosition.stage,
+      realizedSlippage: 0.005
     });
 
-    this.portfolio += pnl;
-    this.riskManager.updatePnL(pnl);
+    // Update simulation SOL balance
+    this.portfolioSol += (pnlUsd / this.solPrice);
+    this.riskManager.updatePnL(pnlUsd);
     
-    if (pnl < 0) this.dailyLosses++;
+    // Update circuit breaker
+    if (pnlUsd < 0) this.dailyLosses++;
     else this.dailyLosses = 0;
 
     this.activePosition = null;
   }
 
+  /**
+   * Stats Reporting for Validation Phase (Step 9)
+   */
   public getStats() {
-    const totalR = this.history.reduce((sum, h) => sum + h.Rmultiple, 0);
+    const totalR = this.history.reduce((s, h) => s + h.Rmultiple, 0);
+    const wins = this.history.filter(h => h.Rmultiple > 0);
+    const losses = this.history.filter(h => h.Rmultiple <= 0);
+
     return {
-      finalBalance: this.portfolio,
+      finalBalanceSol: this.portfolioSol,
       totalTrades: this.history.length,
+      winRate: (wins.length / (this.history.length || 1)) * 100,
+      avgWinR: wins.reduce((s, h) => s + h.Rmultiple, 0) / (wins.length || 1),
+      avgLossR: losses.reduce((s, h) => s + h.Rmultiple, 0) / (losses.length || 1),
       expectancyR: this.history.length === 0 ? 0 : totalR / this.history.length
     };
   }

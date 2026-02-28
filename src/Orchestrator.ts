@@ -4,211 +4,186 @@ import type { Position } from "./types/TradeTypes.js";
 import type { IExecutionLayer } from "./execution/interfaces/IExecutionLayer.js";
 
 // Core Engine Imports
-import { RegimeEngine } from "./core/RegimeEngine.js";
 import { EntryEngine } from "./core/EntryEngine.js";
 import { PositionSizer } from "./core/PositionSizer.js";
-import { ExitEngine } from "./core/ExitEngine.js";
-import { ScalingEngine } from "./core/ScalingEngine.js";
+import { ExitEngine, type ExitDecision } from "./core/ExitEngine.js";
+import { SafetyFilter } from "./core/SafetyFilter.js";
+import { StalenessEngine } from "./core/StalenessEngine.js";
 
-// Infrastructure Imports
+// Infrastructure
 import { PortfolioRiskManager } from "./risk/PortfolioRiskManager.js";
 import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
 import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
 import { QuoteValidator } from "./execution/QuoteValidator.js";
 import { TradeLogger } from "./simulation/TradeLogger.js";
 
+export enum EngineType {
+  IGNITION = "IGNITION",
+  MODERATE = "MODERATE"
+}
+
 export class Orchestrator {
-  private activePositions: Map<string, Position> = new Map();
+  private activePositions: Map<string, Position & { type: EngineType }> = new Map();
+  private staleCounters: Map<string, number> = new Map();
   private isProcessingExit: boolean = false; 
   private readonly riskManager: PortfolioRiskManager;
   private readonly executionLayer: IExecutionLayer;
   private readonly liqMonitor: LiquidityMonitor;
-  private readonly auditor: ExecutionAuditor;
-  private readonly initialBalance: number;
-  private readonly riskPercent: number;
+  private tradeCountThisHour: number = 0;
+  private lastHourReset: number = Date.now();
 
-  constructor(initialBalance: number, executionLayer: IExecutionLayer, riskPercent: number = 0.015) {
-    this.initialBalance = initialBalance;
-    this.riskManager = new PortfolioRiskManager(initialBalance);
+  constructor(initialSol: number, executionLayer: IExecutionLayer) {
+    this.riskManager = new PortfolioRiskManager(initialSol * 140);
     this.executionLayer = executionLayer;
     this.liqMonitor = new LiquidityMonitor();
-    this.auditor = new ExecutionAuditor();
-    this.riskPercent = riskPercent;
   }
 
-  /**
-   * 1) SAFETY LOOP (Triggered every 3s in main.ts)
-   * High-frequency monitoring for stop-losses and liquidity rugs.
-   */
-  public async monitorSafety(tokenAddress: string, currentPrice: number, currentLiquidity: number): Promise<void> {
+  public async monitorSafety(tokenAddress: string, price: number, liquidity: number): Promise<void> {
     const position = this.activePositions.get(tokenAddress);
     if (!position || this.isProcessingExit) return;
 
-    const timeElapsedMs = Date.now() - position.openTime;
-    const unrealizedPnL = (currentPrice - position.entryPrice) * position.quantity;
-
-    // --- HIGH-FREQUENCY OVERRIDES (Every 3s) ---
-
-    // 1. Hard 5-Minute Timeout (Micro-Test Safety)
-    if (CONFIG.MICRO_LIVE_TEST || CONFIG.DRY_MULTI_TOKEN) {
-      if (timeElapsedMs >= 5 * 60 * 1000) {
-        console.log(`[SAFETY EXIT] 5m Timeout reached for ${tokenAddress.slice(0,4)}.`);
-        await this.closePosition(tokenAddress, currentPrice, "MICRO_TIMEOUT");
+    if (this.liqMonitor.shouldEmergencyExit(liquidity, position.initialLiquidity, position.symbol)) {
+        await this.closePosition(tokenAddress, price, "LIQUIDITY_RUG_OR_DRAIN");
         return;
-      }
     }
 
-    // 2. Hard 1R Stop Loss (Dollar based)
-    if (unrealizedPnL <= -position.riskAmount) {
-      console.log(`[SAFETY EXIT] Hard 1R Stop reached for ${tokenAddress.slice(0,4)}.`);
-      await this.closePosition(tokenAddress, currentPrice, "HARD_STOP_LOSS");
+    const provider = (global as any).provider;
+    const volDelta = provider?.getVolumeDelta?.(tokenAddress) || { buy2m: 1, sell2m: 1 };
+    const history = provider?.getRecentCandles(tokenAddress, 2) || [];
+
+    const decision: ExitDecision = ExitEngine.evaluate(
+      position,
+      price,
+      history[0] || { close: price } as Candle,
+      { current: liquidity, entry: position.initialLiquidity },
+      volDelta,
+      Math.floor((Date.now() - position.openTime) / 60000),
+      position.breakoutLevel
+    );
+
+    if (decision.action === 'EXIT') {
+      await this.closePosition(tokenAddress, price, decision.reason);
       return;
     }
 
-    // 3. Technical Stop Loss Check
-    if (currentPrice <= position.stopPrice) {
-      console.log(`[SAFETY EXIT] Technical Stop hit for ${tokenAddress.slice(0,4)}.`);
-      await this.closePosition(tokenAddress, currentPrice, "TECHNICAL_STOP");
-      return;
+    let updatedPos = { ...position, lastPrice: price, peakPrice: Math.max(position.peakPrice, price) };
+    if (decision.updatedStop && decision.updatedStop > position.stopPrice) {
+      updatedPos.stopPrice = decision.updatedStop;
     }
-
-    // 4. Rapid Liquidity Drop Check
-    if (this.liqMonitor.shouldEmergencyExit(currentLiquidity)) {
-      console.log(`[SAFETY EXIT] Liquidity Rug detected for ${tokenAddress.slice(0,4)}.`);
-      await this.closePosition(tokenAddress, currentPrice, "LIQUIDITY_RUG");
-      return;
-    }
-
-    // 5. Update Peak Price for trailing stop accuracy
-    if (currentPrice > position.peakPrice) {
-      this.activePositions.set(tokenAddress, { ...position, peakPrice: currentPrice });
-    }
+    this.activePositions.set(tokenAddress, updatedPos);
   }
 
-  /**
-   * 2) STRATEGIC LOOP (Triggered every 60s in main.ts)
-   * Handles entries, scaling, and regime-based management.
-   */
-  public async tick(tokenAddress: string, current: Candle, history: Candle[], breadthScore: number): Promise<void> {
-    if (this.isProcessingExit) return;
+  public async tick(tokenAddress: string, current: Candle, history: Candle[], breadth: number): Promise<{ prune: boolean }> {
+    if (this.isProcessingExit) return { prune: false };
+    if (Date.now() - this.lastHourReset > 3600000) {
+      this.tradeCountThisHour = 0;
+      this.lastHourReset = Date.now();
+    }
 
-    const regime = RegimeEngine.calculate(breadthScore, 0, 0.04);
     const position = this.activePositions.get(tokenAddress);
-    const id = tokenAddress.slice(0, 4);
-
     if (position) {
-      await this.manageStrategicScaling(tokenAddress, current);
+      await this.monitorSafety(tokenAddress, current.close, current.liquidity);
     } else {
-      const signal = EntryEngine.evaluate(history, regime, CONFIG.MIN_LIQUIDITY_USD);
-      
-      console.log(`[EVAL] ${id} | Px: $${current.close.toFixed(6)} | Filter: ${signal.enter ? "APPROVED" : "REJECTED"} | Reason: ${signal.reason}`);
-
-      if (signal.enter) {
-        await this.evaluateEntry(tokenAddress, current, history, regime);
-      }
+      const isStale = StalenessEngine.isStale(history, current.close, current.close * 0.02);
+      if (isStale) return { prune: true };
+      await this.evaluateEntry(tokenAddress, current, history);
     }
+    return { prune: false };
   }
 
-  private async manageStrategicScaling(tokenAddress: string, current: Candle): Promise<void> {
-    const position = this.activePositions.get(tokenAddress);
-    if (!position) return;
+  private async evaluateEntry(tokenAddress: string, current: Candle, history: Candle[]): Promise<void> {
+    if (this.activePositions.size >= CONFIG.MAX_TOTAL_CONCURRENT) return;
+    if (this.tradeCountThisHour >= CONFIG.MAX_TRADES_PER_HOUR) return;
 
-    // Scaling Logic
-    const currentBalance = this.initialBalance + this.riskManager.getStatus().currentPnL;
-    const scaling = ScalingEngine.evaluate(position, current.close, currentBalance, current.liquidity);
+    const type = current.liquidity <= CONFIG.IGNITION_LIQ_UPPER ? EngineType.IGNITION : EngineType.MODERATE;
+    const activeOfType = Array.from(this.activePositions.values()).filter(p => p.type === type).length;
+    const maxAllowed = type === EngineType.IGNITION ? CONFIG.MAX_CONCURRENT_IGNITION : CONFIG.MAX_CONCURRENT_MODERATE;
     
-    if (scaling.addQuantity > 0) {
-      const result = await this.executionLayer.executeBuy({
-        tokenAddress,
-        amountUsd: scaling.addQuantity * current.close,
-        slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000,
-        marketPrice: current.close
-      });
-      
-      this.auditor.auditExecution(current.close, result);
-      this.activePositions.set(tokenAddress, { 
-        ...position, 
-        quantity: position.quantity + result.filledQuantity, 
-        stage: scaling.newStage as 1 | 2 | 3 
-      });
-      console.log(`[ORCHESTRATOR] SCALE -> ${tokenAddress.slice(0,4)} Stage ${scaling.newStage}`);
+    if (activeOfType >= maxAllowed) return;
+
+    const liq5mAgo = history[history.length - 6]?.liquidity || current.liquidity;
+    const signal = EntryEngine.evaluate(history, 24, liq5mAgo);
+    const symbol = (global as any).provider?.getSymbol(tokenAddress) || tokenAddress.slice(0,4);
+
+    if (!signal.enter) {
+        if (signal.reason.includes("FILTERED") || signal.reason.includes("LOW") || signal.reason.includes("NO")) {
+            TradeLogger.log(`[NEAR MISS] ${symbol} | Reason: ${signal.reason}`, 'INFO');
+        }
+        return;
     }
 
-    // Stop Ratchet
-    const newStop = ExitEngine.calculateUpdatedStop(position, current.close, current.close * 0.05, 0.04, current.liquidity, Date.now());
-    if (newStop > position.stopPrice) {
-      this.activePositions.set(tokenAddress, { ...position, stopPrice: newStop });
-    }
-  }
-
-  private async evaluateEntry(tokenAddress: string, current: Candle, history: Candle[], regime: any): Promise<void> {
-    // CORRELATION CAP: If we already have 2 open positions, block all new entries
-    if (this.activePositions.size >= 2) {
-      // Log silently to avoid console spam
-      return; 
+    if (!SafetyFilter.isSafe(tokenAddress, history, current.liquidity)) {
+        TradeLogger.log(`[SAFETY REJECT] ${symbol}: Failed Anti-Rug Shield`, 'WARN');
+        return;
     }
 
-    // PORTFOLIO HEAT: Check if current active risk exceeds 4R (Safety Shield)
-    const currentActiveRiskR = Array.from(this.activePositions.values())
-      .reduce((sum, pos) => sum + (pos.riskAmount / 15), 0);
+    const solPrice = 140; 
+    const baseRiskSol = type === EngineType.IGNITION ? CONFIG.RISK_IGNITION_SOL : CONFIG.RISK_MODERATE_SOL;
+    
+     // Calculate 5m price change for adaptive sizing
+    const p5mEarlier = history[history.length - 6]?.close || current.open;
+    const pChange5m = ((current.close - p5mEarlier) / p5mEarlier) * 100;
 
-    if (!this.riskManager.canTrade(this.activePositions.size, currentActiveRiskR)) {
-      console.log(`[RISK] Entry blocked: Portfolio Heat too high.`);
-      return;
-    }
-
-    const currentBalance = this.initialBalance + this.riskManager.getStatus().currentPnL;
-    const sizing = PositionSizer.calculateStage1Size(currentBalance, currentBalance * this.riskPercent, current.close, current.close * 0.90, current.liquidity);
-
-    if (!sizing.rejected && sizing.quantity > 0) {
+    const sizing = PositionSizer.calculatePosition(
+    solPrice, 
+    current.close, 
+    current.close * 0.90, 
+    current.liquidity, 
+    1.0, // Assuming 1.0 SOL base for math
+    pChange5m,
+    baseRiskSol // Fixed: Passing 7th argument
+    );
+    if (!sizing.isRejected) {
       const validation = QuoteValidator.validate({
-        amountUsd: sizing.quantity * current.close,
-        poolLiquidity: current.liquidity,
-        slippageEstimate: sizing.expectedSlippage,
-        isRiskActive: true
+        amountUsd: sizing.quantity * current.close, poolLiquidity: current.liquidity,
+        liquidity5mChange: (current.liquidity - liq5mAgo) / liq5mAgo,
+        isRiskActive: this.riskManager.canTrade(this.activePositions.size, 0)
       });
 
-      if (!validation.valid) return;
+      if (!validation.valid) {
+          TradeLogger.log(`[FIREWALL] Blocked ${symbol}: ${validation.reason}`, 'WARN');
+          return;
+      }
 
       const result = await this.executionLayer.executeBuy({ 
         tokenAddress, amountUsd: sizing.quantity * current.close, 
-        slippageTolerance: CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000, marketPrice: current.close 
+        slippageTolerance: 0.02, marketPrice: current.close 
       });
 
       this.activePositions.set(tokenAddress, { 
-        entryPrice: result.filledPrice, quantity: result.filledQuantity, 
-        stopPrice: result.filledPrice * 0.90, stage: 1, 
-        riskAmount: sizing.effectiveRisk, peakPrice: result.filledPrice, openTime: Date.now() 
+        symbol, type, entryPrice: result.filledPrice, quantity: result.filledQuantity, 
+        stopPrice: result.filledPrice * 0.90, stage: 1, riskAmount: sizing.riskUsd, 
+        peakPrice: result.filledPrice, openTime: Date.now(), lastPrice: result.filledPrice,
+        breakoutLevel: current.close, initialLiquidity: current.liquidity
       });
       
-      console.log(`[ORCHESTRATOR] ENTRY Stage 1 | ${tokenAddress.slice(0,4)} | Price: ${result.filledPrice.toFixed(4)}`);
+      this.tradeCountThisHour++;
+      // FIXED: Logging specific risk unit used
+      TradeLogger.log(`[ENTRY] ${type} ${symbol} | Price: $${result.filledPrice.toFixed(6)} | Risk: ${baseRiskSol} SOL`, 'TRADE');
     }
   }
 
   private async closePosition(tokenAddress: string, price: number, reason: string): Promise<void> {
     const position = this.activePositions.get(tokenAddress);
-    if (!position || this.isProcessingExit) return;
-    
+    if (!position) return;
     this.isProcessingExit = true;
     try {
-      const result = await this.executionLayer.executeSell({ 
-        tokenAddress, quantity: position.quantity, 
-        slippageTolerance: 0.01, marketPrice: price 
-      });
-
+      const result = await this.executionLayer.executeSell({ tokenAddress, quantity: position.quantity, slippageTolerance: 0.02, marketPrice: price });
       const finalPnl = (result.filledPrice - position.entryPrice) * result.filledQuantity;
       this.riskManager.updatePnL(finalPnl);
       
-      console.log(`[ORCHESTRATOR] EXIT ${tokenAddress.slice(0,4)} (${reason}) | PnL: $${finalPnl.toFixed(2)}`);
+      TradeLogger.logTrade({
+        symbol: position.symbol,
+        entryPrice: position.entryPrice,
+        exitPrice: result.filledPrice,
+        Rmultiple: finalPnl / position.riskAmount,
+        reason,
+        pnlUsd: finalPnl
+      });
+
       this.activePositions.delete(tokenAddress);
-    } finally {
-      this.isProcessingExit = false;
-    }
+    } finally { this.isProcessingExit = false; }
   }
-  /**
-   * Provides a read-only view of the portfolio's current PnL and health.
-   */
-  public getFullStatus() {
-    return this.riskManager.getStatus();
-  }
+
+  public getFullStatus() { return this.riskManager.getStatus(); }
 }

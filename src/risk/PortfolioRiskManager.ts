@@ -12,7 +12,7 @@ export class PortfolioRiskManager {
   private readonly maxDailyDrawdownLimit: number;
   
   // Rule 5: Portfolio Heat Limit (Total R at risk across all trades)
-  private readonly MAX_TOTAL_HEAT_R = 4.0; 
+  private readonly MAX_TOTAL_HEAT_R = 4.0; // Max 4 units of R total exposure
   private readonly MAX_CONCURRENT_TRADES = 2;
 
   constructor(initialBalance: number, drawdownLimitPercent: number = 0.04) {

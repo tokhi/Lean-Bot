@@ -3,95 +3,59 @@ import { LiveMarketProvider } from "./providers/LiveMarketProvider.js";
 import { Orchestrator } from "./Orchestrator.js";
 import { OrderExecutor } from "./execution/OrderExecutor.js";
 import { MarketScanner } from "./providers/MarketScanner.js";
-
-/**
- * SOLANA MOMENTUM AGENT V2.3 — MAIN ORCHESTRATOR
- * 
- * Objectives:
- * 1. Strategic Loop (60s): Analyze breakouts and volume acceleration.
- * 2. Safety Loop (4s): Instant stop-loss and liquidity monitoring.
- * 3. Dashboard: Real-time PnL and evaluation reasoning.
- */
+import { TradeLogger } from "./simulation/TradeLogger.js";
 
 async function main() {
-  // 1. STARTUP BANNER
-  console.log("\n" + "=".repeat(60));
-  if (CONFIG.EXECUTION_MODE === "LIVE" && CONFIG.MICRO_LIVE_TEST) {
-    console.log("⚠️  MICRO LIVE TEST MODE ACTIVE ⚠️");
-    console.log("   Capital strictly capped ($5 Risk / $30 Position)");
-    console.log("   Supervised Execution Required");
-  } else if (CONFIG.EXECUTION_MODE === "DRY_RUN") {
-    console.log("   RUNNING IN MAINNET DRY-RUN MODE");
-    console.log("   Simulating entries on real-time data.");
-  }
-  console.log("=".repeat(60));
+  TradeLogger.log(`=== SOLANA MOMENTUM AGENT V4.6 — GECKO UNIFIED ===`, 'INFO');
 
-  // 2. INITIALIZE INFRASTRUCTURE
   const provider = new LiveMarketProvider();
-  const orchestrator = new Orchestrator(1000, new OrderExecutor());
-  
-  // Default fallback (WIF)
-  let activeWatchlist: string[] = ["412zDygnwP9DzitnQVgRKUFFTDmrYScFch6P2k39pump"];
+  (global as any).provider = provider;
+  const orchestrator = new Orchestrator(1.0, new OrderExecutor());
+  let watchlist: string[] = [];
 
-  // 3. SCANNER SYNC (Runs every 5m)
-  const refreshWatchlist = async () => {
-    if (CONFIG.DRY_MULTI_TOKEN && CONFIG.EXECUTION_MODE === "DRY_RUN") {
-      console.log("\n[SCANNER] Re-scanning Solana for High-Velocity pairs...");
-      const trending = await MarketScanner.getTrendingTokens(3);
-      if (trending.length > 0) {
-        // Keep unique tokens
-        activeWatchlist = Array.from(new Set([...trending.map(t => t.mint)]));
-        console.log(`[SCANNER] Watchlist: ${trending.map(t => t.symbol).join(", ")}`);
-      }
+  const refresh = async () => {
+    TradeLogger.log("Refreshing discovery funnel...", 'INFO');
+    const trading = Array.from((orchestrator as any).activePositions.keys()) as string[];
+    
+    // Discover Hot Tokens (Intensity Rank)
+    const hot = await MarketScanner.discoverHotTokens(CONFIG.MAX_ACTIVE_TOKENS, watchlist);
+    
+    if (hot.length === 0 && trading.length === 0) {
+        TradeLogger.log("No valid movers in corridor. Waiting...", 'WARN');
+    } else {
+        watchlist = Array.from(new Set([...trading, ...hot.map(t => t.mint)])).slice(0, 3);
+        hot.forEach(t => provider.setSymbol(t.mint, t.symbol));
+        TradeLogger.log(`Watchlist: ${watchlist.map(m => provider.getSymbol(m)).join(", ")}`, 'INFO');
     }
   };
 
-  await refreshWatchlist();
-  if (CONFIG.DRY_MULTI_TOKEN) setInterval(refreshWatchlist, 5 * 60 * 1000);
+  await refresh();
+  setInterval(refresh, 300000);
 
-  // 4. SAFETY LOOP (High Frequency - 4s)
-  provider.subscribePriceUpdates(activeWatchlist, async (address, price) => {
-    const liq = provider.getPoolLiquidity(address);
-    const history = provider.getRecentCandles(address, 7);
-    const id = address.slice(0, 4);
-
-    // Instant Safety Check
-    await orchestrator.monitorSafety(address, price, liq);
-    
-    // Non-scrolling Ticker
-    process.stdout.write(`\r[TICK] ${id}: $${price.toFixed(6)} | Liq: $${Math.round(liq/1000)}k | Mem: ${history.length}/7 `);
+  // Explicit typing (address: string, price: number) fixes TS7006
+  provider.subscribePriceUpdates(watchlist, async (addr: string, price: number) => {
+    const liq = provider.getPoolLiquidity(addr);
+    await orchestrator.monitorSafety(addr, price, liq);
+    process.stdout.write(`\r[TICK] ${provider.getSymbol(addr)}: $${price.toFixed(6)} | Liq: $${Math.round(liq/1000)}k    `);
   });
 
-  // 5. STRATEGIC EVALUATION LOOP (Every 60s)
   setInterval(async () => {
-    const status = orchestrator.getFullStatus();
-    
-    console.log(`\n\n` + "=".repeat(65));
-    console.log(`--- DASHBOARD | Session PnL: $${status.currentPnL.toFixed(2)} | Status: ${status.active ? 'ACTIVE' : 'HIBERNATE'} ---`);
-    console.log("=".repeat(65));
-    
-    for (const mint of activeWatchlist) {
-      const id = mint.slice(0, 4);
-      
-      // Roll price ticks into an OHLCV candle
-      provider.rollCandle(mint);
-      
-      const candles = provider.getRecentCandles(mint, 7);
-
-      if (candles.length >= 7) {
-        const current = candles[candles.length - 1]!;
-        // Execute deterministic Core Engine
-        await orchestrator.tick(mint, current, candles, provider.getGlobalBreadth());
+    console.log(`\n\n--- DASHBOARD | PnL: $${orchestrator.getFullStatus().currentPnL.toFixed(2)} | Active: ${(orchestrator as any).activePositions.size} ---`);
+    for (const m of watchlist) {
+      provider.rollCandle(m);
+      const hist = provider.getRecentCandles(m, 7);
+      if (hist.length >= 7) {
+        const current = hist[hist.length-1]!;
+        const res = await orchestrator.tick(m, current, hist, 5);
+        // Rotation logic if stale
+        if (res.prune && !(orchestrator as any).activePositions.has(m)) {
+            watchlist = watchlist.filter(item => item !== m);
+        }
       } else {
-        console.log(`[WAIT] ${id} building history... (${candles.length}/7)`);
+        console.log(`[WAIT] ${provider.getSymbol(m)} building memory: ${hist.length}/7`);
       }
     }
   }, 60000);
 }
 
-// Global Process Protection
-main().catch((err) => {
-  console.error("\n[FATAL] System Crash:");
-  console.error(err);
-  process.exit(1);
-});
+main().catch(console.error);

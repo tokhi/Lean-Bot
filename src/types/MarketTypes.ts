@@ -3,15 +3,20 @@
  * Used for deterministic price action and volume analysis.
  */
 export interface Candle {
-  readonly timestamp: number;
-  readonly open: number;
-  readonly high: number;
-  readonly low: number;
-  readonly close: number;
-  readonly volume: number;
-  readonly liquidity: number; // USD value of pool depth at this candle
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  liquidity: number;
+  upperWickPct: number;
 }
 
+export enum EngineType {
+  IGNITION = "IGNITION",
+  MODERATE = "MODERATE"
+}
 /**
  * MarketProvider is the contract for any data source (Simulated or Live).
  * This ensures the Trading Engine remains 100% deterministic and agnostic 

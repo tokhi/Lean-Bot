@@ -5,53 +5,34 @@ export interface ValidationResult {
   readonly reason?: string;
 }
 
-/**
- * QuoteValidator V2.1
- * 
- * The "Pre-Trade Firewall". Validates market microstructure and 
- * portfolio health against hardcoded CONFIG guardrails.
- */
 export class QuoteValidator {
   /**
-   * Validates if a trade is safe to proceed.
+   * V4.0 Pre-Trade Firewall
    */
   public static validate(params: {
     amountUsd: number;
     poolLiquidity: number;
-    slippageEstimate: number;
-    isRiskActive: boolean; // From PortfolioRiskManager.canTrade()
+    liquidity5mChange: number; // Step 4 Requirement
+    isRiskActive: boolean;
   }): ValidationResult {
     
-    // 1. Check Portfolio-Level Circuit Breaker (Daily Drawdown)
-    if (!params.isRiskActive) {
-      return { valid: false, reason: "DAILY_DRAWDOWN_OR_CIRCUIT_BREAKER_ACTIVE" };
+    if (!params.isRiskActive) return { valid: false, reason: "PORTFOLIO_RISK_LIMIT_REACHED" };
+
+    // 1. Liquidity Floor/Ceiling
+    if (params.poolLiquidity < CONFIG.MIN_LIQUIDITY_USD) return { valid: false, reason: "LIQUIDITY_BELOW_FLOOR" };
+    if (params.poolLiquidity > CONFIG.MAX_LIQUIDITY_USD) return { valid: false, reason: "LIQUIDITY_ABOVE_CEILING" };
+
+    // 2. Liquidity Growth (Step 4)
+    if (params.liquidity5mChange < CONFIG.MIN_LIQUIDITY_GROWTH_5M) {
+        return { 
+          valid: false, 
+          reason: `STAGNANT_LIQUIDITY: ${(params.liquidity5mChange * 100).toFixed(1)}% < 5%` 
+        };
     }
 
-    // 2. Check Liquidity Floor (Hard Constraint)
-    if (params.poolLiquidity < CONFIG.MIN_LIQUIDITY_USD) {
-      return { 
-        valid: false, 
-        reason: `INSUFFICIENT_LIQUIDITY: Found $${params.poolLiquidity.toLocaleString()}, Need $${CONFIG.MIN_LIQUIDITY_USD.toLocaleString()}` 
-      };
-    }
-
-    // 3. Check Price Impact (Microstructure Guardrail)
-    const priceImpact = params.amountUsd / params.poolLiquidity;
-    if (priceImpact > CONFIG.MAX_POOL_IMPACT_PCT) {
-      return { 
-        valid: false, 
-        reason: `PRICE_IMPACT_TOO_HIGH: ${(priceImpact * 100).toFixed(4)}% > ${(CONFIG.MAX_POOL_IMPACT_PCT * 100).toFixed(2)}%` 
-      };
-    }
-
-    // 4. Check Slippage Tolerance (BPS Conversion)
-    const maxSlippageDec = CONFIG.SLIPPAGE_TOLERANCE_BPS / 10000;
-    if (params.slippageEstimate > maxSlippageDec) {
-      return { 
-        valid: false, 
-        reason: `EXCESSIVE_SLIPPAGE: ${(params.slippageEstimate * 100).toFixed(2)}% > ${(maxSlippageDec * 100).toFixed(2)}%` 
-      };
-    }
+    // 3. Price Impact (Max 5% of Pool - Step 1.4)
+    const impact = params.amountUsd / params.poolLiquidity;
+    if (impact > 0.05) return { valid: false, reason: `EXCESSIVE_IMPACT: ${(impact * 100).toFixed(1)}% > 5%` };
 
     return { valid: true };
   }
