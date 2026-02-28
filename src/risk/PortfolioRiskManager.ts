@@ -15,6 +15,10 @@ export class PortfolioRiskManager {
   private readonly MAX_TOTAL_HEAT_R = 4.0; // Max 4 units of R total exposure
   private readonly MAX_CONCURRENT_TRADES = 2;
 
+  private winCount: number = 0;
+  private lossCount: number = 0;
+
+
   constructor(initialBalance: number, drawdownLimitPercent: number = 0.04) {
     this.dailyStartBalance = initialBalance;
     this.maxDailyDrawdownLimit = initialBalance * drawdownLimitPercent;
@@ -22,6 +26,20 @@ export class PortfolioRiskManager {
 
   public updatePnL(amount: number): void {
     this.currentPnL += amount;
+    if (amount > 0) this.winCount++;
+    else if (amount < 0) this.lossCount++;
+  }
+
+  public getHourlySummary() {
+    const totalTrades = this.winCount + this.lossCount;
+    const winRate = totalTrades > 0 ? (this.winCount / totalTrades) * 100 : 0;
+    return {
+      totalTrades,
+      wins: this.winCount,
+      losses: this.lossCount,
+      winRate: winRate.toFixed(2) + "%",
+      netPnL: "$" + this.currentPnL.toFixed(2)
+    };
   }
 
   /**

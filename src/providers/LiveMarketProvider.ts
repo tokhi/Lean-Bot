@@ -4,45 +4,49 @@ export class LiveMarketProvider implements MarketProvider {
   private candleBuffer: Map<string, Candle[]> = new Map();
   private tickBuffer: Map<string, { price: number; vol: number; liq: number }[]> = new Map();
   private symbolMap: Map<string, string> = new Map();
-  private readonly GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1";
+  
+  private readonly GECKO_BASE = "https://api.geckoterminal.com/api/v2/networks/solana";
 
   public setSymbol(mint: string, symbol: string) { this.symbolMap.set(mint, symbol); }
   public getSymbol(mint: string): string { return this.symbolMap.get(mint) || mint.slice(0, 4); }
 
-  public async pollPrices(mints: string[]): Promise<void> {
+  /**
+   * Public Price Fetcher for Safety Loop
+   */
+  public async getCurrentPrice(tokenAddress: string): Promise<number> {
     try {
-      const res = await fetch(this.GECKO_TRENDING, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } });
+      // Use the search/tokens endpoint to get specific pool data
+      const url = `${this.GECKO_BASE}/tokens/${tokenAddress}/pools?page=1`;
+      const res = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) return 0;
+
       const json = await res.json() as any;
-      const pools = json.data || [];
+      const pool = (json.data || []).sort((a: any, b: any) => 
+        parseFloat(b.attributes.reserve_in_usd) - parseFloat(a.attributes.reserve_in_usd)
+      )[0];
 
-      for (const mint of mints) {
-        const pool = pools.find((p: any) => p.relationships?.base_token?.data?.id === `solana_${mint}`);
-        if (pool) {
-          const attr = pool.attributes;
-          const ticks = this.tickBuffer.get(mint) || [];
-          ticks.push({ 
-            price: parseFloat(attr.base_token_price_usd), 
-            vol: parseFloat(attr.volume_usd.h1), 
-            liq: parseFloat(attr.reserve_in_usd) 
-          });
-          this.tickBuffer.set(mint, ticks);
-        }
-      }
-    } catch (e) {}
+      if (!pool) return 0;
+      const attr = pool.attributes;
+      const price = parseFloat(attr.base_token_price_usd);
+      
+      const ticks = this.tickBuffer.get(tokenAddress) || [];
+      ticks.push({ price, vol: parseFloat(attr.volume_usd.h1), liq: parseFloat(attr.reserve_in_usd) });
+      this.tickBuffer.set(tokenAddress, ticks);
+
+      return price;
+    } catch { return 0; }
   }
 
-  public subscribePriceUpdates(mints: string[], cb: (address: string, price: number) => void): void {
-    setInterval(async () => {
-      await this.pollPrices(mints);
-      for (const mint of mints) {
-        const last = this.tickBuffer.get(mint)?.slice(-1)[0];
-        if (last) cb(mint, last.price);
-      }
-    }, 5000);
+  public getPoolLiquidity(tokenAddress: string): number {
+    const ticks = this.tickBuffer.get(tokenAddress) || [];
+    return ticks.length > 0 ? ticks[ticks.length - 1]!.liq : 0;
   }
 
-  public getPoolLiquidity(mint: string): number {
-    return this.tickBuffer.get(mint)?.slice(-1)[0]?.liq || 0;
+  public getVolumeDelta(tokenAddress: string) {
+    const ticks = this.tickBuffer.get(tokenAddress) || [];
+    if (ticks.length < 2) return { buy2m: 1, sell2m: 1 };
+    const curr = ticks[ticks.length - 1]!, prev = ticks[ticks.length - 2]!;
+    return curr.price >= prev.price ? { buy2m: Math.abs(curr.vol - prev.vol), sell2m: 0 } : { buy2m: 0, sell2m: Math.abs(curr.vol - prev.vol) };
   }
 
   public rollCandle(tokenAddress: string): void {
@@ -63,6 +67,5 @@ export class LiveMarketProvider implements MarketProvider {
   }
 
   public getRecentCandles(mint: string, count: number): Candle[] { return (this.candleBuffer.get(mint) || []).slice(-count); }
-  public getVolumeDelta(tokenAddress: string) { return { buy2m: 100, sell2m: 100 }; }
   public getGlobalBreadth() { return 5; }
 }

@@ -1,42 +1,40 @@
 import type { Candle } from "../types/MarketTypes.js";
 
 /**
- * StalenessEngine V4.2
+ * StalenessEngine V4.5
  * 
- * Determines if a token should be removed from the watchlist.
- * Logic: A token is STALE if price is range-bound, volume is dead, 
- * and volatility has collapsed.
+ * Logic:
+ * 1. DOWNTREND (Aggressive): If price drops > 3% from local high, prune instantly.
+ * 2. STAGNATION (Dead Money): If price is sideways AND volume is declining.
  */
 export class StalenessEngine {
-  /**
-   * @param candles - Historical data
-   * @param currentPrice - Current market price
-   * @param atr - Current Average True Range (Volatility)
-   */
-  public static isStale(candles: Candle[], currentPrice: number, atr: number): boolean {
-    if (candles.length < 7) return false;
+  public static isStale(history: Candle[], currentPrice: number, atr: number): boolean {
+    if (history.length < 7) return false;
 
-    const recent = candles.slice(-7);
-    const highs = recent.map(c => c.high);
-    const lows = recent.map(c => c.low);
+    const recent = history.slice(-7);
+    const highestHigh = Math.max(...recent.map(c => c.high));
+    
+    // --- 1. DOWNTREND CHECK (The "Trash" Filter) ---
+    // If we are more than 3% away from the local peak, the "Spike" has failed.
+    const dropFromPeak = (highestHigh - currentPrice) / highestHigh;
+    if (dropFromPeak > 0.03) return true;
 
-    // 1. Price Range Check: (MaxHigh - MinLow) / Current < 1.5%
-    // If a token moves less than 1.5% in 7 minutes, it's sideways.
-    const range = (Math.max(...highs) - Math.min(...lows)) / currentPrice;
-    const isRangeBound = range < 0.015;
+    // --- 2. VOLATILITY COMPRESSION (Normalized ATR) ---
+    // ATR / Price gives us the percentage of the "wiggle".
+    const volPercent = atr / currentPrice;
+    const isSideways = volPercent < 0.008; // Less than 0.8% average movement
 
-    // 2. Volume Check: Avg Vol Multiplier last 5 < 1.2x
-    // If volume hasn't increased, there is no momentum.
-    const last5 = candles.slice(-5);
-    const prevAvgVol = candles.slice(-10, -5).reduce((s, c) => s + c.volume, 0) / 5;
-    const currentAvgVol = last5.reduce((s, c) => s + c.volume, 0) / 5;
-    const isVolumeDead = (currentAvgVol / (prevAvgVol || 1)) < 1.2;
+    // --- 3. VOLUME DECAY ---
+    // Average volume of the last 3 candles vs average of the 7-candle window.
+    const avgVolWindow = recent.reduce((s, c) => s + c.volume, 0) / 7;
+    const avgVolRecent = recent.slice(-3).reduce((s, c) => s + c.volume, 0) / 3;
+    const isVolumeFading = avgVolRecent < avgVolWindow;
 
-    // 3. Volatility Floor: Normalized ATR < 0.5%
-    // Ensures we aren't pruning tokens that are getting ready to explode.
-    const isVolatilityLow = (atr / currentPrice) < 0.005;
+    // --- 4. THE DECISION ---
+    // We only prune "Sideways" if the volume is also "Fading".
+    // If it's sideways but volume is GROWING, we keep it (Accumulation).
+    if (isSideways && isVolumeFading) return true;
 
-    // Return true only if it's both sideways and quiet
-    return isRangeBound && isVolumeDead && isVolatilityLow;
+    return false;
   }
 }

@@ -9,18 +9,17 @@ import { PositionSizer } from "./core/PositionSizer.js";
 import { ExitEngine, type ExitDecision } from "./core/ExitEngine.js";
 import { SafetyFilter } from "./core/SafetyFilter.js";
 import { StalenessEngine } from "./core/StalenessEngine.js";
+import { ScalingEngine } from "./core/ScalingEngine.js";
+import { RegimeEngine } from "./core/RegimeEngine.js";
 
-// Infrastructure
+// Infrastructure Imports
 import { PortfolioRiskManager } from "./risk/PortfolioRiskManager.js";
 import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
 import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
 import { QuoteValidator } from "./execution/QuoteValidator.js";
 import { TradeLogger } from "./simulation/TradeLogger.js";
 
-export enum EngineType {
-  IGNITION = "IGNITION",
-  MODERATE = "MODERATE"
-}
+export enum EngineType { IGNITION = "IGNITION", MODERATE = "MODERATE" }
 
 export class Orchestrator {
   private activePositions: Map<string, Position & { type: EngineType }> = new Map();
@@ -29,20 +28,25 @@ export class Orchestrator {
   private readonly riskManager: PortfolioRiskManager;
   private readonly executionLayer: IExecutionLayer;
   private readonly liqMonitor: LiquidityMonitor;
-  private tradeCountThisHour: number = 0;
-  private lastHourReset: number = Date.now();
+  private readonly initialSol: number;
 
   constructor(initialSol: number, executionLayer: IExecutionLayer) {
+    this.initialSol = initialSol;
     this.riskManager = new PortfolioRiskManager(initialSol * 140);
     this.executionLayer = executionLayer;
     this.liqMonitor = new LiquidityMonitor();
   }
 
+  /**
+   * 1) SAFETY LOOP (4s Frequency)
+   * High-priority checks for Rugs, Structural Failures, and Technical Stops.
+   */
   public async monitorSafety(tokenAddress: string, price: number, liquidity: number): Promise<void> {
     const position = this.activePositions.get(tokenAddress);
-    if (!position || this.isProcessingExit) return;
+    if (!position || this.isProcessingExit || price <= 0) return;
 
-    if (this.liqMonitor.shouldEmergencyExit(liquidity, position.initialLiquidity, position.symbol)) {
+    // A. Liquidity Rug Check (3-tick confirmation)
+    if (this.liqMonitor.shouldEmergencyExit(liquidity, position.initialLiquidity, tokenAddress)) {
         await this.closePosition(tokenAddress, price, "LIQUIDITY_RUG_OR_DRAIN");
         return;
     }
@@ -50,11 +54,13 @@ export class Orchestrator {
     const provider = (global as any).provider;
     const volDelta = provider?.getVolumeDelta?.(tokenAddress) || { buy2m: 1, sell2m: 1 };
     const history = provider?.getRecentCandles(tokenAddress, 2) || [];
+    const lastClosedCandle = history[0] || ({ close: price } as Candle);
 
+    // B. Predator Exit Logic
     const decision: ExitDecision = ExitEngine.evaluate(
       position,
       price,
-      history[0] || { close: price } as Candle,
+      lastClosedCandle,
       { current: liquidity, entry: position.initialLiquidity },
       volDelta,
       Math.floor((Date.now() - position.openTime) / 60000),
@@ -66,6 +72,7 @@ export class Orchestrator {
       return;
     }
 
+    // C. Trailing Updates
     let updatedPos = { ...position, lastPrice: price, peakPrice: Math.max(position.peakPrice, price) };
     if (decision.updatedStop && decision.updatedStop > position.stopPrice) {
       updatedPos.stopPrice = decision.updatedStop;
@@ -73,116 +80,171 @@ export class Orchestrator {
     this.activePositions.set(tokenAddress, updatedPos);
   }
 
-  public async tick(tokenAddress: string, current: Candle, history: Candle[], breadth: number): Promise<{ prune: boolean }> {
+  /**
+   * 2) STRATEGIC LOOP (30s-60s Frequency)
+   */
+  public async tick(tokenAddress: string, current: Candle, redis: any, breadth: number): Promise<{ prune: boolean }> {
     if (this.isProcessingExit) return { prune: false };
-    if (Date.now() - this.lastHourReset > 3600000) {
-      this.tradeCountThisHour = 0;
-      this.lastHourReset = Date.now();
-    }
 
     const position = this.activePositions.get(tokenAddress);
+    const symbol = (global as any).provider?.getSymbol(tokenAddress) || tokenAddress.slice(0, 4);
+
     if (position) {
-      await this.monitorSafety(tokenAddress, current.close, current.liquidity);
-    } else {
-      const isStale = StalenessEngine.isStale(history, current.close, current.close * 0.02);
-      if (isStale) return { prune: true };
-      await this.evaluateEntry(tokenAddress, current, history);
+      await this.manageStrategicScaling(tokenAddress, current);
+      return { prune: false };
     }
+
+    // --- GLOBAL MEMORY EVALUATION ---
+    const history = await redis.getHistory(tokenAddress);
+    
+    if (history.length >= 7) {
+      const p5mCandle = history[history.length - 6];
+      if (!p5mCandle) return { prune: false };
+
+      const liq5mAgo = p5mCandle.liquidity;
+      
+      // Determine if entry signals fire
+      const signal = EntryEngine.evaluate(history, 24, liq5mAgo);
+
+      if (signal.enter) {
+        await this.evaluateEntry(tokenAddress, current, history, signal.reason);
+        return { prune: false };
+      } else {
+        // RULE: Log Near-Miss for transparency
+        if (!signal.reason.includes("BUILDING")) {
+            console.log(`[SKIP] ${symbol.padEnd(10)} | Reason: ${signal.reason}`);
+        }
+      }
+
+      // Staleness Check
+      const atr = history.slice(-5).reduce((sum: number, c: Candle) => sum + (c.high - c.low), 0) / 5;
+      if (StalenessEngine.isStale(history, current.close, atr)) return { prune: true };
+    }
+
     return { prune: false };
   }
 
-  private async evaluateEntry(tokenAddress: string, current: Candle, history: Candle[]): Promise<void> {
+  private async manageStrategicScaling(tokenAddress: string, current: Candle): Promise<void> {
+    const position = this.activePositions.get(tokenAddress)!;
+    const unrealizedPnL = (current.close - position.entryPrice) * position.quantity;
+    const unrealizedR = unrealizedPnL / position.riskAmount;
+    process.stdout.write(`\r[ACTIVE] ${position.symbol} | PnL: $${unrealizedPnL.toFixed(2)} (${unrealizedR.toFixed(2)}R) | Stop: $${position.stopPrice.toFixed(6)} `);
+
+    const currentBalUsd = (this.initialSol * 140) + this.riskManager.getStatus().currentPnL;
+    const scaling = ScalingEngine.evaluate(position, current.close, currentBalUsd, current.liquidity);
+    
+    if (scaling.addQuantity > 0) {
+      const result = await this.executionLayer.executeBuy({
+        tokenAddress, amountUsd: scaling.addQuantity * current.close,
+        slippageTolerance: 0.02, marketPrice: current.close
+      });
+      
+      this.activePositions.set(tokenAddress, { 
+        ...position, quantity: position.quantity + result.filledQuantity, stage: scaling.newStage as 1 | 2 | 3 
+      });
+      TradeLogger.log(`[ORCHESTRATOR] SCALE -> ${position.symbol} Stage ${scaling.newStage}`, 'TRADE');
+    }
+  }
+
+  private async evaluateEntry(tokenAddress: string, current: Candle, history: Candle[], signalReason: string): Promise<void> {
+    // FIXED: Corrected CONFIG property access
     if (this.activePositions.size >= CONFIG.MAX_TOTAL_CONCURRENT) return;
-    if (this.tradeCountThisHour >= CONFIG.MAX_TRADES_PER_HOUR) return;
+
+    if (!SafetyFilter.isSafe(tokenAddress, history, current.liquidity)) return;
 
     const type = current.liquidity <= CONFIG.IGNITION_LIQ_UPPER ? EngineType.IGNITION : EngineType.MODERATE;
     const activeOfType = Array.from(this.activePositions.values()).filter(p => p.type === type).length;
     const maxAllowed = type === EngineType.IGNITION ? CONFIG.MAX_CONCURRENT_IGNITION : CONFIG.MAX_CONCURRENT_MODERATE;
-    
     if (activeOfType >= maxAllowed) return;
 
-    const liq5mAgo = history[history.length - 6]?.liquidity || current.liquidity;
-    const signal = EntryEngine.evaluate(history, 24, liq5mAgo);
-    const symbol = (global as any).provider?.getSymbol(tokenAddress) || tokenAddress.slice(0,4);
-
-    if (!signal.enter) {
-        if (signal.reason.includes("FILTERED") || signal.reason.includes("LOW") || signal.reason.includes("NO")) {
-            TradeLogger.log(`[NEAR MISS] ${symbol} | Reason: ${signal.reason}`, 'INFO');
-        }
-        return;
-    }
-
-    if (!SafetyFilter.isSafe(tokenAddress, history, current.liquidity)) {
-        TradeLogger.log(`[SAFETY REJECT] ${symbol}: Failed Anti-Rug Shield`, 'WARN');
-        return;
-    }
-
-    const solPrice = 140; 
     const baseRiskSol = type === EngineType.IGNITION ? CONFIG.RISK_IGNITION_SOL : CONFIG.RISK_MODERATE_SOL;
     
-     // Calculate 5m price change for adaptive sizing
-    const p5mEarlier = history[history.length - 6]?.close || current.open;
-    const pChange5m = ((current.close - p5mEarlier) / p5mEarlier) * 100;
+    const p5mCandle = history[history.length - 6];
+    if (!p5mCandle) return;
+
+    const p5m = ((current.close - p5mCandle.close) / p5mCandle.close) * 100;
 
     const sizing = PositionSizer.calculatePosition(
-    solPrice, 
-    current.close, 
-    current.close * 0.90, 
-    current.liquidity, 
-    1.0, // Assuming 1.0 SOL base for math
-    pChange5m,
-    baseRiskSol // Fixed: Passing 7th argument
+      140, // SolPrice mock
+      current.close, 
+      current.close * 0.90, // 10% Stop
+      current.liquidity, 
+      this.initialSol, 
+      p5m, 
+      baseRiskSol
     );
+
     if (!sizing.isRejected) {
       const validation = QuoteValidator.validate({
-        amountUsd: sizing.quantity * current.close, poolLiquidity: current.liquidity,
-        liquidity5mChange: (current.liquidity - liq5mAgo) / liq5mAgo,
+        amountUsd: sizing.quantity * current.close, 
+        poolLiquidity: current.liquidity,
+        liquidity5mChange: (current.liquidity - p5mCandle.liquidity) / p5mCandle.liquidity,
         isRiskActive: this.riskManager.canTrade(this.activePositions.size, 0)
       });
 
       if (!validation.valid) {
-          TradeLogger.log(`[FIREWALL] Blocked ${symbol}: ${validation.reason}`, 'WARN');
+          TradeLogger.log(`[FIREWALL] Blocked entry for ${tokenAddress.slice(0,4)}: ${validation.reason}`, 'WARN');
           return;
       }
 
       const result = await this.executionLayer.executeBuy({ 
-        tokenAddress, amountUsd: sizing.quantity * current.close, 
-        slippageTolerance: 0.02, marketPrice: current.close 
+        tokenAddress, 
+        amountUsd: sizing.quantity * current.close, 
+        slippageTolerance: 0.02, 
+        marketPrice: current.close 
       });
 
       this.activePositions.set(tokenAddress, { 
-        symbol, type, entryPrice: result.filledPrice, quantity: result.filledQuantity, 
-        stopPrice: result.filledPrice * 0.90, stage: 1, riskAmount: sizing.riskUsd, 
-        peakPrice: result.filledPrice, openTime: Date.now(), lastPrice: result.filledPrice,
-        breakoutLevel: current.close, initialLiquidity: current.liquidity
+        symbol: (global as any).provider.getSymbol(tokenAddress), 
+        type,
+        entryPrice: result.filledPrice, 
+        quantity: result.filledQuantity, 
+        stopPrice: result.filledPrice * 0.90, 
+        stage: 1, 
+        riskAmount: sizing.riskUsd, 
+        peakPrice: result.filledPrice, 
+        openTime: Date.now(), 
+        lastPrice: result.filledPrice,
+        breakoutLevel: current.close, 
+        initialLiquidity: current.liquidity
       });
       
-      this.tradeCountThisHour++;
-      // FIXED: Logging specific risk unit used
-      TradeLogger.log(`[ENTRY] ${type} ${symbol} | Price: $${result.filledPrice.toFixed(6)} | Risk: ${baseRiskSol} SOL`, 'TRADE');
+      TradeLogger.log(`[ENTRY] ${type} on ${tokenAddress.slice(0,4)} | Risk: ${baseRiskSol} SOL`, 'TRADE');
     }
   }
 
   private async closePosition(tokenAddress: string, price: number, reason: string): Promise<void> {
     const position = this.activePositions.get(tokenAddress);
-    if (!position) return;
+    if (!position || this.isProcessingExit || price <= 0) return;
+    
     this.isProcessingExit = true;
     try {
-      const result = await this.executionLayer.executeSell({ tokenAddress, quantity: position.quantity, slippageTolerance: 0.02, marketPrice: price });
+      const result = await this.executionLayer.executeSell({ 
+        tokenAddress, 
+        quantity: position.quantity, 
+        slippageTolerance: 0.02, 
+        marketPrice: price 
+      });
+
       const finalPnl = (result.filledPrice - position.entryPrice) * result.filledQuantity;
       this.riskManager.updatePnL(finalPnl);
       
+      // Safety: Protect against division by zero for R calculation
+      const riskUnit = position.riskAmount || 1;
+
       TradeLogger.logTrade({
-        symbol: position.symbol,
-        entryPrice: position.entryPrice,
+        symbol: position.symbol, 
+        entryPrice: position.entryPrice, 
         exitPrice: result.filledPrice,
-        Rmultiple: finalPnl / position.riskAmount,
-        reason,
+        Rmultiple: finalPnl / riskUnit, 
+        reason, 
         pnlUsd: finalPnl
       });
 
       this.activePositions.delete(tokenAddress);
-    } finally { this.isProcessingExit = false; }
+    } finally { 
+      this.isProcessingExit = false; 
+    }
   }
 
   public getFullStatus() { return this.riskManager.getStatus(); }
