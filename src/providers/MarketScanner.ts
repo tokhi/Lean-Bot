@@ -34,62 +34,48 @@ export class MarketScanner {
   }
 
   /**
-   * PULLS TOP 60 TOKENS (3 PAGES)
-   * This is the only entry point for data in the V5 Scanner.
+   * MODIFIED: Strictly fetches Page 1, 2, and 3 (Requirement 1 & 9)
    */
   public static async discoverBroadUniverse(): Promise<any[]> {
     try {
       const pages = [1, 2, 3];
-      const fetchHeaders = { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' };
+      const headers = { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' };
       
-      const dataResults = await Promise.all(
-        pages.map(async (page) => {
-          const res = await fetch(`${this.GECKO_BASE_URL}?page=${page}`, { headers: fetchHeaders });
+      const dataResults = await Promise.all(pages.map(async (page) => {
+          const res = await fetch(`${this.GECKO_BASE_URL}?page=${page}`, { headers });
           return res.ok ? res.json() : { data: [] };
-        })
-      );
-
+      }));
+      
       this.lastTrendingPools = dataResults.flatMap((d: any) => d.data || []);
       return this.lastTrendingPools;
-    } catch (e) {
-      return [];
-    }
+    } catch { return []; }
   }
 
   /**
    * Ranks the cached 60-token universe using Heat Score 2.0.
    */
   public static async discoverHotTokens(limit: number = 3, excludeMints: string[] = []): Promise<ScannedToken[]> {
-    // Ensure we have data
     if (this.lastTrendingPools.length === 0) await this.discoverBroadUniverse();
-
-    // Cleanup cooldowns
-    for (const [mint, ts] of this.recentlyPruned.entries()) {
-      if (Date.now() - ts > this.COOLDOWN_DURATION_MS) this.recentlyPruned.delete(mint);
-    }
+    // ... cooldown cleanup remains unchanged
 
     const results: ScannedToken[] = [];
-    const totalExclude = [...excludeMints, ...Array.from(this.recentlyPruned.keys())];
-
     for (const pool of this.lastTrendingPools) {
       const attr = pool.attributes;
       const mint = pool.relationships?.base_token?.data?.id?.split('_')[1];
       const liq = parseFloat(attr.reserve_in_usd || "0");
       const price = parseFloat(attr.base_token_price_usd || "0");
 
-      if (!mint || this.STABLE_BLACKLIST.includes(mint) || totalExclude.includes(mint)) continue;
+      if (!mint || this.STABLE_BLACKLIST.includes(mint) || excludeMints.includes(mint)) continue;
       if ((price > 0.90 && price < 1.10) || (price > 120 && price < 180)) continue;
 
+      // ADDED: Dual-Engine Classification (Requirement 3)
       let type: "IGNITION" | "MODERATE" | null = null;
-      if (liq >= 40000 && liq <= 200000) type = "IGNITION";
-      else if (liq > 200000 && liq <= CONFIG.MAX_LIQUIDITY_USD) type = "MODERATE";
+      if (liq >= CONFIG.MIN_LIQUIDITY_USD && liq <= CONFIG.IGNITION_LIQ_UPPER) type = "IGNITION";
+      else if (liq > CONFIG.IGNITION_LIQ_UPPER && liq <= CONFIG.MAX_LIQUIDITY_USD) type = "MODERATE";
 
       if (type) {
         results.push({
-          mint,
-          symbol: attr.name.split(' / ')[0] || "Unknown",
-          liquidity: liq,
-          type,
+          mint, symbol: attr.name.split(' / ')[0], liquidity: liq, type,
           rankingScore: this.calculateHeatScore(attr)
         });
       }

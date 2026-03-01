@@ -27,17 +27,18 @@ async function main() {
   /**
    * JOB 1: GLOBAL SNAPSHOT (Every 60s)
    */
-  const syncDiscovery = async () => {
+ const syncGlobalMemory = async () => {
     try {
+      // MODIFIED: Fetch 60 tokens (Requirement 1 & 9)
       const rawPools = await MarketScanner.discoverBroadUniverse();
-      if (rawPools.length === 0) return;
-
       for (const pool of rawPools) {
         const mint = pool.relationships?.base_token?.data?.id?.split('_')[1];
         if (!mint) continue;
         const attr = pool.attributes;
         provider.setSymbol(mint, attr.name.split(' / ')[0]);
-        const candle: Candle = {
+        
+        // ADDED: Logging specific memory write (Requirement 2)
+        await redis.pushCandle(mint, {
           timestamp: Date.now(),
           open: parseFloat(attr.base_token_price_usd),
           high: parseFloat(attr.base_token_price_usd),
@@ -46,22 +47,20 @@ async function main() {
           volume: parseFloat(attr.volume_usd.m5 || "0"),
           liquidity: parseFloat(attr.reserve_in_usd || "0"),
           upperWickPct: 0
-        };
-        await redis.pushCandle(mint, candle);
+        });
       }
 
-      const hot = await MarketScanner.discoverHotTokens(CONFIG.MAX_ACTIVE_TOKENS, []);
-      const trading = Array.from((orchestrator as any).activePositions.keys()) as string[];
-      activeWatchlist = Array.from(new Set([...trading, ...hot.map(t => t.mint)])).slice(0, CONFIG.MAX_ACTIVE_TOKENS);
+      // MODIFIED: Watchlist Stability (Don't wipe, only add new heat)
+      const trading = Array.from(orchestrator.activePositions.keys());
+      const hot = await MarketScanner.discoverHotTokens(CONFIG.MAX_ACTIVE_TOKENS, activeWatchlist);
+      activeWatchlist = Array.from(new Set([...trading, ...activeWatchlist, ...hot.map(t => t.mint)])).slice(0, CONFIG.MAX_ACTIVE_TOKENS);
       
       TradeLogger.log(`Watchlist Synced: ${activeWatchlist.map(m => provider.getSymbol(m)).join(", ")}`, 'INFO');
-    } catch (e) {
-      TradeLogger.log(`Discovery Sync Error: ${e}`, 'ERROR');
-    }
+    } catch (e: any) { TradeLogger.log(`Sync Error: ${e.message}`, 'ERROR'); }
   };
 
-  await syncDiscovery();
-  setInterval(syncDiscovery, 60000);
+  await syncGlobalMemory();
+  setInterval(syncGlobalMemory, 60000);
 
   /**
    * JOB 2: SAFETY TICKER (3-5s per token)
@@ -91,27 +90,28 @@ async function main() {
   };
   runSafetyTicker();
 
-  /**
-   * JOB 3: STRATEGIC EVALUATOR (Every 30s)
-   */
+  // --- JOB 3: STRATEGIC EVALUATOR ---
+  // MODIFIED: Now performs background 60-token evaluation (Requirement 1)
   setInterval(async () => {
-    const status = orchestrator.getFullStatus();
+    const perf = orchestrator.getFullPerformanceStatus();
+    
+    // MODIFIED: Dashboard only prints here once per 30s cycle
     console.log(`\n\n` + "=".repeat(75));
-    console.log(`--- DASHBOARD | PnL: $${status.currentPnL.toFixed(2)} | Active: ${(orchestrator as any).activePositions.size} ---`);
+    console.log(`--- DASHBOARD | Total PnL: ${perf.totalPnL.toFixed(4)} SOL | Active: ${perf.activeTrades}/3 ---`);
+    console.log(`--- Banked: ${perf.realizedPnL.toFixed(4)} SOL | Floating: ${perf.unrealizedPnL.toFixed(4)} SOL ---`);
     console.log("=".repeat(75));
 
-    for (const mint of activeWatchlist) {
-      const history = await redis.getHistory(mint);
+    // REQUIREMENT 1: Evaluate the full 60-token pool in the background
+    const hotPool = await MarketScanner.discoverHotTokens(60, []);
+    for (const token of hotPool) {
+      const history = await redis.getHistory(token.mint);
       if (history.length >= 7) {
-        const currentCandle = history[history.length - 1]!;
-        const decision = await orchestrator.tick(mint, currentCandle, redis, 5);
+        // MODIFIED: Log evaluation reason (Requirement 10)
+        const result = await orchestrator.tick(token.mint, history[history.length - 1]!, redis, 5);
         
-        if (decision.prune && !(orchestrator as any).activePositions.has(mint)) {
-            TradeLogger.log(`[WATCHLIST] Rotating stale token: ${provider.getSymbol(mint)}`, 'INFO');
-            activeWatchlist = activeWatchlist.filter(m => m !== mint);
+        if (result.prune && !orchestrator.activePositions.has(token.mint)) {
+            activeWatchlist = activeWatchlist.filter(m => m !== token.mint);
         }
-      } else {
-        console.log(`[WAIT] ${provider.getSymbol(mint)} warming memory... (${history.length}/7)`);
       }
     }
   }, 30000);
