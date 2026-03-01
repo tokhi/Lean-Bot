@@ -18,9 +18,9 @@ export class TradeLogger {
     exitPrice: number,
     Rmultiple: number,
     reason: string,
-    pnlUsd: number
+    pnlSol: number // Fixed: Changed from pnlUsd to pnlSol
   }) {
-    this.log(`[TRADE_CLOSED] ${data.symbol} | Result: ${data.Rmultiple.toFixed(2)}R | PnL: $${data.pnlUsd.toFixed(2)} | Reason: ${data.reason}`, 'TRADE');
+    this.log(`[TRADE_CLOSED] ${data.symbol} | Result: ${data.Rmultiple.toFixed(2)}R | PnL: ${data.pnlSol.toFixed(4)} SOL | Reason: ${data.reason}`, 'TRADE');
     this.log(` > In: $${data.entryPrice.toFixed(6)} | Out: $${data.exitPrice.toFixed(6)}`, 'TRADE');
     
     const path = `./logs/telemetry.json`;

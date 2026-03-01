@@ -3,37 +3,36 @@ import { TradeLogger } from "../simulation/TradeLogger.js";
 export class SafetyFilter {
   private static blacklist: Set<string> = new Set();
 
-  public static isSafe(mint: string, history: any[], currentLiq: number, entryLiq: number = 0): boolean {
+  public static isSafe(mint: string, history: any[], currentLiq: number): boolean {
     if (this.blacklist.has(mint)) return false;
 
     const current = history[history.length - 1];
     const prev = history[history.length - 2];
     if (!current || !prev) return true;
 
-    // 1 & 2) MIN LIQUIDITY & CONCENTRATION
-    const volMult = current.volMult;
+    // REQUIREMENT 8: LIQUIDITY SCREENING
     if (currentLiq < 40000) return false;
-    if (currentLiq < 60000 && volMult > 6) return false;
+    
+    const liq5mAgo = history[history.length - 6]?.liquidity || currentLiq;
+    const liqDrain = (liq5mAgo - currentLiq) / liq5mAgo;
+    if (liqDrain > 0.10) {
+        TradeLogger.log(`[ANTI-RUG] ${mint.slice(0,4)}: 10% Liquidity Drain Detected`, 'WARN');
+        return false;
+    }
 
-    // 3) LIQUIDITY INSTABILITY (5% drain in 2m)
-    const liq2mAgo = history[history.length - 3]?.liquidity || currentLiq;
-    const liqDrain2m = (liq2mAgo - currentLiq) / liq2mAgo;
-    if (liqDrain2m > 0.05) return false;
+    // CONCENTRATION & PUMP/DUMP
+    const body = Math.abs(current.close - current.open);
+    const upperWick = current.high - Math.max(current.open, current.close);
+    if (upperWick > body * 0.7) {
+        TradeLogger.log(`[ANTI-RUG] ${mint.slice(0,4)}: Excessive Upper Wick`, 'WARN');
+        return false;
+    }
 
-    // 4) PUMP-AND-DUMP CANDLE
-    if (prev.changePct > 25 && current.retracePct > 70) return false;
-
-    // 5) PARABOLIC WICK
-    if (current.upperWickPct > 70 && current.liqGrowth <= 0) return false;
-
-    // 6) DEAD LIQUIDITY
-    if (current.liqGrowth <= 0 && current.volMult < prev.volMult) return false;
-
-    // 7) BLACKLIST TRIGGER
+    // BLACKLIST TRIGGER
     const priceDrop2m = (history[history.length - 3]?.close - current.close) / history[history.length - 3]?.close;
-    if (priceDrop2m > 0.40 && liqDrain2m > 0.10) {
+    if (priceDrop2m > 0.40 && liqDrain > 0.10) {
       this.blacklist.add(mint);
-      TradeLogger.log(`RUG_DETECTED for ${mint}. Blacklisting.`, 'ERROR');
+      TradeLogger.log(`!!! RUG DETECTED for ${mint}. Blacklisted.`, 'ERROR');
       return false;
     }
 

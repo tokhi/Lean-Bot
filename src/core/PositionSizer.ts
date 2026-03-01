@@ -1,72 +1,48 @@
 import { CONFIG } from "../config.js";
 
 export interface SizingResult {
-  readonly quantity: number;
-  readonly riskUsd: number;
+  readonly buyAmountSol: number;
+  readonly riskAmountSol: number; // The 10% stop loss value in SOL
   readonly isRejected: boolean;
-  readonly reason?: string | undefined;
-  readonly volatilityFactor: number;
+  readonly reason?: string;
 }
 
 export class PositionSizer {
-  private static readonly PORTFOLIO_EXPOSURE_CAP_PCT = 0.70; 
-  private static readonly LIQUIDITY_IMPACT_CAP_PCT = 0.05; 
+  private static readonly LIQUIDITY_IMPACT_CAP_PCT = 0.05; // Requirement 1.4: 5% limit
 
   /**
-   * Calculates position size using SOL-based risk and 5m Volatility.
+   * V5.5 Pure SOL Allocation Logic
    */
-  public static calculatePosition(
-    solPrice: number,
-    entryPrice: number,
-    stopPrice: number,
+  public static calculateFixedSolSize(
+    mode: "IGNITION" | "MODERATE",
     poolLiquidityUsd: number,
-    walletBalanceSol: number,
-    priceChange5m: number,
-    baseRiskSol: number // Changed: Pass specific risk unit (0.15 or 0.20)
+    solPriceUsd: number,
+    walletBalanceSol: number
   ): SizingResult {
     
-    // 1. COMPUTE VOLATILITY FACTOR
-    const volatilityFactor = Math.min(Math.max(Math.abs(priceChange5m) / 5, 0.5), 2.0);
+    // 1. Determine Target Buy (Exactly 1.0 or 2.0 SOL)
+    let targetBuySol = mode === "IGNITION" 
+      ? CONFIG.BUY_AMOUNT_IGNITION_SOL 
+      : CONFIG.BUY_AMOUNT_MODERATE_SOL;
 
-    // 2. APPLY VOLATILITY SCALING TO THE SPECIFIC RISK UNIT
-    const targetRSol = baseRiskSol * volatilityFactor;
+    // 2. Enforce 5% Liquidity Cap
+    const poolDepthSol = poolLiquidityUsd / solPriceUsd;
+    const maxSafeBuySol = poolDepthSol * this.LIQUIDITY_IMPACT_CAP_PCT;
 
-    // 3. CONVERT TO USD FOR TOKEN QUANTITY MATH
-    const rUsd = targetRSol * solPrice;
-    const stopDistanceUsd = Math.abs(entryPrice - stopPrice);
-
-    if (stopDistanceUsd === 0) {
-      return { quantity: 0, riskUsd: 0, isRejected: true, reason: "INVALID_STOP", volatilityFactor: 1 };
+    if (targetBuySol > maxSafeBuySol) {
+      // Downsize to stay under 5% pool impact
+      targetBuySol = maxSafeBuySol;
     }
 
-    // 4. CALCULATE RAW QUANTITY
-    let quantity = rUsd / stopDistanceUsd;
-    let positionValueUsd = quantity * entryPrice;
-
-    // 5. ENFORCE HARD PORTFOLIO & LIQUIDITY CAPS
-    const maxLiqUsd = poolLiquidityUsd * this.LIQUIDITY_IMPACT_CAP_PCT;
-    const maxWalletUsd = (walletBalanceSol * solPrice) * CONFIG.MAX_PORTFOLIO_RISK_PCT;
-
-    let finalMaxUsd = Math.min(maxLiqUsd, maxWalletUsd);
-
-    if (CONFIG.MICRO_LIVE_TEST) {
-        finalMaxUsd = Math.min(finalMaxUsd, CONFIG.MAX_MICRO_POSITION_USD);
+    // 3. Absolute Balance Guard
+    if (targetBuySol > walletBalanceSol * 0.9) {
+        return { buyAmountSol: 0, riskAmountSol: 0, isRejected: true, reason: "INSUFFICIENT_FUNDS" };
     }
 
-    if (positionValueUsd > finalMaxUsd) {
-      positionValueUsd = finalMaxUsd;
-      quantity = positionValueUsd / entryPrice;
-    }
-
-    // 6. FINAL REJECTION LOGIC
-    const isRejected = targetRSol > walletBalanceSol || poolLiquidityUsd < CONFIG.MIN_LIQUIDITY_USD;
-
-    return { 
-        quantity, 
-        riskUsd: quantity * stopDistanceUsd, 
-        isRejected, 
-        volatilityFactor,
-        reason: isRejected ? "RISK_EXCEEDS_CAPACITY" : undefined
+    return {
+      buyAmountSol: targetBuySol,
+      riskAmountSol: targetBuySol * CONFIG.INITIAL_STOP_LOSS_PCT,
+      isRejected: targetBuySol < 0.01 // Minimum trade floor
     };
   }
 }

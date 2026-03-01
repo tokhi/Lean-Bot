@@ -1,29 +1,34 @@
 /**
  * Position represents an active, ongoing trade.
- * Tracks scaling stages and the current risk state.
  */
 export interface Position {
-  readonly symbol: string;           // Added: e.g., "Jellybean"
+  readonly symbol: string;           
   readonly entryPrice: number;
   readonly quantity: number;
   readonly stopPrice: number;
   readonly stage: 1 | 2 | 3;
-  readonly riskAmount: number;
+  readonly riskAmount: number;       // SOL units at risk
   readonly peakPrice: number;
   readonly openTime: number;
-  readonly lastPrice: number;
-  readonly breakoutLevel: number;
-  readonly initialLiquidity: number;
+  readonly lastPrice: number;        
+  readonly breakoutLevel: number;    
+  readonly initialLiquidity: number; 
+  readonly buyAmountSol: number;     // Requirement 8: Fixed SOL allocation
 }
+
+/**
+ * TradeResult represents the post-mortem data of a closed trade.
+ */
 export interface TradeResult {
   readonly entryPrice: number;
   readonly exitPrice: number;
-  readonly Rmultiple: number;
-  readonly duration: number;
-  readonly maxFavorableExcursion: number;
-  readonly maxAdverseExcursion: number;
-  readonly stageReached: number;
-  readonly realizedSlippage: number; // Added for detailed auditing
+  readonly Rmultiple: number;             
+  readonly duration: number;              
+  readonly maxFavorableExcursion: number; 
+  readonly maxAdverseExcursion: number;   
+  readonly stageReached: number;          
+  readonly realizedSlippage: number;      
+  readonly pnlSol: number;                // Requirement 9: Realized SOL gain/loss
 }
 
 /**
