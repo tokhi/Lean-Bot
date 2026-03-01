@@ -1,177 +1,148 @@
 import { CONFIG } from "./config.js";
+import { OrderExecutor } from "./execution/OrderExecutor.js";
+import { TradeLogger } from "./simulation/TradeLogger.js";
 import type { Candle } from "./types/MarketTypes.js";
 import type { Position } from "./types/TradeTypes.js";
-import type { IExecutionLayer, ExecutionOptions } from "./execution/interfaces/IExecutionLayer.js";
-
-// Core Engine Imports
-import { EntryEngine } from "./core/EntryEngine.js";
-import { PositionSizer } from "./core/PositionSizer.js";
-import { ExitEngine, type ExitDecision } from "./core/ExitEngine.js";
-import { SafetyFilter } from "./core/SafetyFilter.js";
-import { StalenessEngine } from "./core/StalenessEngine.js";
-import { ScalingEngine } from "./core/ScalingEngine.js";
-import { RegimeEngine } from "./core/RegimeEngine.js";
-
-// Infrastructure
-import { PortfolioRiskManager } from "./risk/PortfolioRiskManager.js";
-import { LiquidityMonitor } from "./execution/LiquidityMonitor.js";
-import { ExecutionAuditor } from "./execution/ExecutionAuditor.js";
-import { QuoteValidator } from "./execution/QuoteValidator.js";
-import { TradeLogger } from "./simulation/TradeLogger.js";
-import { MarketScanner } from "./providers/MarketScanner.js";
-
-export enum EngineType { IGNITION = "IGNITION", MODERATE = "MODERATE" }
+import { RedisProvider } from "./providers/RedisProvider.js";
 
 export class Orchestrator {
-  public activePositions: Map<string, Position & { type: EngineType }> = new Map();
-  private staleCounters: Map<string, number> = new Map();
-  private isProcessingExit: boolean = false; 
-  private readonly riskManager: PortfolioRiskManager;
-  private realizedPnLSol: number = 0;
+  private maxAllocation: number;
+  private executor: OrderExecutor;
 
-  constructor(private initialSol: number, private executionLayer: IExecutionLayer) {
-    this.riskManager = new PortfolioRiskManager(initialSol * 140);
+  public activePositions: Map<string, Position> = new Map(); // mint → Position
+  private realizedPnL: number = 0;
+  private unrealizedPnL: number = 0;
+
+  constructor(maxAllocationPerTrade: number = 1.0, executor: OrderExecutor) {
+    this.maxAllocation = maxAllocationPerTrade;
+    this.executor = executor;
+    TradeLogger.log(`Orchestrator ready — max/trade: ${maxAllocationPerTrade} SOL`, 'INFO');
   }
 
-  public async monitorSafety(tokenAddress: string, price: number, liquidity: number): Promise<void> {
-    const position = this.activePositions.get(tokenAddress);
-    if (!position || this.isProcessingExit || price <= 0) return;
+  async monitorSafety(mint: string, currentPrice: number, liquidity: number): Promise<void> {
+    const pos = this.activePositions.get(mint);
+    if (!pos) return;
 
-    const updatedPos = { ...position, lastPrice: price };
-    this.activePositions.set(tokenAddress, updatedPos);
+    const sym = (global as any).provider?.getSymbol(mint) || mint.slice(0, 6);
 
-    const provider = (global as any).provider;
-    const volDelta = provider?.getVolumeDelta?.(tokenAddress) || { buy2m: 1, sell2m: 1 };
-    const history: Candle[] = provider?.getRecentCandles(tokenAddress, 2) || [];
-
-    const decision: ExitDecision = ExitEngine.evaluate(
-      updatedPos, price, history[0] || ({ close: price } as Candle),
-      { current: liquidity, entry: position.initialLiquidity },
-      volDelta, Math.floor((Date.now() - position.openTime) / 60000), position.breakoutLevel
-    );
-
-    if (decision.action === 'EXIT') {
-      await this.closePosition(tokenAddress, price, decision.reason);
+    if (currentPrice <= pos.stopPrice) {
+      await this.exitPosition(mint, currentPrice, "Stop-loss 10% triggered");
       return;
     }
 
-    let finalPos = { ...updatedPos, peakPrice: Math.max(position.peakPrice, price) };
-    if (decision.updatedStop && decision.updatedStop > position.stopPrice) {
-      finalPos.stopPrice = decision.updatedStop;
-    }
-    this.activePositions.set(tokenAddress, finalPos);
-  }
-
-  public async tick(tokenAddress: string, current: Candle, redis: any, breadth: number): Promise<{ prune: boolean }> {
-    if (this.isProcessingExit) return { prune: false };
-    const position = this.activePositions.get(tokenAddress);
-    const id = position?.symbol || (global as any).provider?.getSymbol(tokenAddress) || tokenAddress.slice(0, 4);
-
-    if (position) {
-      const unrealized = (current.close / position.entryPrice) * position.buyAmountSol - position.buyAmountSol;
-      process.stdout.write(`\r[ACTIVE] ${position.symbol} (${position.type}) | PnL: ${unrealized.toFixed(4)} SOL | Stop: $${position.stopPrice.toFixed(6)} `);
-      return { prune: false };
-    }
-
-    const history: Candle[] = await redis.getHistory(tokenAddress);
-    if (history.length >= 7) {
-      const startTime = this.staleCounters.get(tokenAddress + "_start") || Date.now();
-      if (!this.staleCounters.has(tokenAddress + "_start")) this.staleCounters.set(tokenAddress + "_start", Date.now());
-      const ageMins = (Date.now() - startTime) / 60000;
-
-      if (ageMins > 3) {
-          const atr = history.slice(-5).reduce((s, c) => s + (c.high - c.low), 0) / 5;
-          if (StalenessEngine.isStale(history, current.close, atr)) {
-              MarketScanner.addToCooldown(tokenAddress);
-              this.staleCounters.delete(tokenAddress + "_start");
-              return { prune: true };
-          }
-      }
-
-      const p5mCandle = history[history.length - 6];
-      if (!p5mCandle) return { prune: false };
-
-      const signal = EntryEngine.evaluate(history, 24, p5mCandle.liquidity);
-      if (signal.enter) {
-        await this.evaluateEntry(tokenAddress, current, history, signal.mode as EngineType, signal.reason);
-      } else if (!signal.reason.includes("BUILDING")) {
-        process.stdout.write(`\r[EVAL] ${id.padEnd(8)} | ${signal.reason.padEnd(30)} `);
-      }
-    }
-    return { prune: false };
-  }
-
-  private async evaluateEntry(tokenAddress: string, current: Candle, history: Candle[], mode: EngineType, reason: string): Promise<void> {
-    const activeOfType = Array.from(this.activePositions.values()).filter(p => p.type === mode).length;
-    const maxAllowed = mode === EngineType.IGNITION ? CONFIG.MAX_CONCURRENT_IGNITION : CONFIG.MAX_CONCURRENT_MODERATE;
-    if (activeOfType >= maxAllowed) return;
-
-    if (!SafetyFilter.isSafe(tokenAddress, history, current.liquidity)) return;
-
-    const sizing = PositionSizer.calculateFixedSolSize(mode, current.liquidity, 140, 10.0);
-
-    if (!sizing.isRejected) {
-      const result = await this.executionLayer.executeBuy({ 
-        tokenAddress, amountSol: sizing.buyAmountSol, marketPrice: current.close, slippageTolerance: 0.02 
-      });
-
-      this.activePositions.set(tokenAddress, { 
-        symbol: (global as any).provider.getSymbol(tokenAddress), 
-        type: mode, 
-        buyAmountSol: sizing.buyAmountSol,
-        entryPrice: result.filledPrice, 
-        quantity: result.filledQuantity, 
-        stopPrice: result.filledPrice * (1 - CONFIG.INITIAL_STOP_LOSS_PCT), 
-        riskAmount: sizing.riskAmountSol, 
-        peakPrice: result.filledPrice, 
-        openTime: Date.now(), 
-        lastPrice: result.filledPrice,
-        breakoutLevel: current.close, 
-        initialLiquidity: current.liquidity,
-        stage: 1
-      });
-      
-      TradeLogger.log(`[ENTRY] ${mode} | Size: ${sizing.buyAmountSol} SOL | Trigger: ${reason}`, 'TRADE');
+    // Optional: update lastPrice, check trailing, etc.
+    // For now, just safety check
+    if (Math.random() < 0.03) {
+      TradeLogger.log(
+        `[SAFETY] ${sym} @ $${currentPrice.toFixed(6)}  SL @ $${pos.stopPrice.toFixed(6)}`,
+        'INFO'
+      );
     }
   }
 
-  private async closePosition(tokenAddress: string, price: number, reason: string): Promise<void> {
-    const position = this.activePositions.get(tokenAddress);
-    if (!position || this.isProcessingExit) return;
-    this.isProcessingExit = true;
+  async tick(
+    mint: string,
+    candle: Candle,
+    redis: RedisProvider,
+    convictionThreshold: number = 5
+  ): Promise<{ prune: boolean }> {
+    const history = await redis.getHistory(mint);
+    if (history.length < 7) return { prune: false };
+
+    const shouldPrune = history.length > 25 && candle.close < candle.open * 0.65;
+
+    return { prune: shouldPrune };
+  }
+
+  async enterPosition(
+    mint: string,
+    buyAmountSol: number,
+    entryPrice: number,
+    // Pass these from main.ts evaluation context (e.g. from candle/history)
+    currentLiquidity: number = 0,     // Required for initialLiquidity
+    breakoutLevel: number = entryPrice // Placeholder; compute from history if needed
+  ): Promise<boolean> {
+    if (this.activePositions.size >= 3) {
+      TradeLogger.log(`[ENTRY BLOCKED] Max 3 positions active`, 'WARN');
+      return false;
+    }
+
+    buyAmountSol = Math.min(buyAmountSol, this.maxAllocation);
+
     try {
-      const result = await this.executionLayer.executeSell({ tokenAddress, quantity: position.quantity, slippageTolerance: 0.02, marketPrice: price });
-      const exitValueSol = (result.filledPrice / position.entryPrice) * position.buyAmountSol;
-      const pnlSol = exitValueSol - position.buyAmountSol;
-      this.realizedPnLSol += pnlSol;
-      this.riskManager.updatePnL(pnlSol * 140);
-      
-      TradeLogger.logTrade({
-        symbol: position.symbol, entryPrice: position.entryPrice, exitPrice: result.filledPrice,
-        Rmultiple: pnlSol / position.riskAmount, reason, pnlSol: pnlSol
-      });
-      this.activePositions.delete(tokenAddress);
-      this.staleCounters.delete(tokenAddress + "_start");
-    } finally { this.isProcessingExit = false; }
-  }
+      // Live trading: await this.executor.buy(mint, buyAmountSol);
+      TradeLogger.log(
+        `[SIM BUY] ${mint} — ${buyAmountSol} SOL @ $${entryPrice.toFixed(6)}`,
+        'INFO'
+      );
 
-  public getFullPerformanceStatus() {
-    let unrealized = 0;
-    for (const pos of this.activePositions.values()) {
-        unrealized += (pos.lastPrice / pos.entryPrice) * pos.buyAmountSol - pos.buyAmountSol;
+      const symbol = (global as any).provider?.getSymbol(mint) || mint.slice(0, 8);
+      const quantity = buyAmountSol / entryPrice; // tokens bought
+      const stopPrice = entryPrice * 0.90;        // 10% stop as required
+      const now = Date.now();
+
+      const position: Position = {
+        symbol,
+        entryPrice,
+        quantity,
+        stopPrice,
+        stage: 1,                           // Assume entry stage; adjust per your logic
+        riskAmount: buyAmountSol,           // Full exposure at risk initially
+        peakPrice: entryPrice,
+        openTime: now,
+        lastPrice: entryPrice,
+        breakoutLevel,
+        initialLiquidity: currentLiquidity, // Use real liq from candle
+        buyAmountSol,
+      };
+
+      this.activePositions.set(mint, position);
+      return true;
+    } catch (err: any) {
+      TradeLogger.log(`[ENTRY FAIL] ${mint} — ${err.message}`, 'ERROR');
+      return false;
     }
-    return {
-      realizedPnL: this.realizedPnLSol,
-      unrealizedPnL: unrealized,
-      totalPnL: this.realizedPnLSol + unrealized,
-      activeTrades: this.activePositions.size
-    };
   }
 
-  public getFullStatus() { return this.riskManager.getStatus(); }
-  
-  public logHourlyPortfolioAudit(): void {
-    const perf = this.getFullPerformanceStatus();
-    TradeLogger.log(`PORT_AUDIT | Total: ${perf.totalPnL.toFixed(4)} SOL | Active: ${perf.activeTrades}`, 'INFO');
+  async exitPosition(mint: string, exitPrice: number, reason: string = "Exit"): Promise<number> {
+    const pos = this.activePositions.get(mint);
+    if (!pos) {
+      TradeLogger.log(`[EXIT SKIP] No position for ${mint}`, 'WARN');
+      return 0;
+    }
+
+    try {
+      // Live: await this.executor.sell(mint, pos.buyAmountSol);
+      TradeLogger.log(
+        `[SIM SELL] ${pos.symbol} — reason: ${reason} @ $${exitPrice.toFixed(6)}`,
+        'INFO'
+      );
+
+      const exitValue = pos.quantity * exitPrice;
+      const pnl = exitValue - pos.buyAmountSol;
+
+      this.realizedPnL += pnl;
+
+      this.activePositions.delete(mint);
+
+      TradeLogger.log(
+        `[TRADE CLOSED] ${pos.symbol} PnL: ${pnl.toFixed(4)} SOL (${(pnl / pos.buyAmountSol * 100).toFixed(1)}%) — ${reason}`,
+        'TRADE'
+      );
+
+      return pnl;
+    } catch (err: any) {
+      TradeLogger.log(`[EXIT FAIL] ${mint} — ${err.message}`, 'ERROR');
+      return 0;
+    }
+  }
+
+  getFullPerformanceStatus() {
+    return {
+      totalPnL: this.realizedPnL + this.unrealizedPnL,
+      realizedPnL: this.realizedPnL,
+      unrealizedPnL: this.unrealizedPnL,
+      activeTrades: this.activePositions.size,
+    };
   }
 }
